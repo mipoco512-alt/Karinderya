@@ -1,15 +1,23 @@
--- Karinderya Gameplay Recorder v2 (argument-only compatibility mode). Read RECORDER.md.
+-- Karinderya Gameplay Recorder v3.1 (automatic logging; lightweight Show Log File). Read RECORDER.md.
 
 local createGameplayRecorder = (function()
 -- The hook only snapshots Lua arguments and forwards the original call directly.
 -- Instance methods, filtering, context and observers run later in Flush(). A
 -- nested Instance namecall must never replace the game's pending method name.
 local function createGameplayRecorder(ctx)
-    local BUS_KEY, VERSION = "__KarinderyaGameplayRecorderHook", "gameplay-recorder-v2"
-    local LEGACY_VERSION = "gameplay-recorder-v1"
-    local MAX_RECORDS, MAX_NODES, MAX_STRINGS = 1000, 512, 24 * 1024
-    local MAX_DEPTH, MAX_ENTRIES, MAX_ARGUMENTS = 6, 64, 64
-    local MAX_PENDING = 256
+    local BUS_KEY, VERSION = "__KarinderyaGameplayRecorderHook", "gameplay-recorder-v3"
+    local compatible = { [VERSION] = true, ["gameplay-recorder-v2"] = true, ["gameplay-recorder-v1"] = true }
+    -- Settings may reduce these ceilings; invalid/unbounded values use defaults.
+    local ceilings = { records = 100, pending = 64, nodes = 128, strings = 4096, depth = 4, entries = 24, arguments = 32 }
+    local limits = {}
+    for name, maximum in pairs(ceilings) do
+        local value = type(ctx.limits) == "table" and rawget(ctx.limits, name) or nil
+        limits[name] = type(value) == "number" and value == value and value >= 1 and value < math.huge
+            and math.min(maximum, math.floor(value)) or maximum
+    end
+    local MAX_RECORDS, MAX_NODES, MAX_STRINGS = limits.records, limits.nodes, limits.strings
+    local MAX_DEPTH, MAX_ENTRIES, MAX_ARGUMENTS = limits.depth, limits.entries, limits.arguments
+    local MAX_PENDING = limits.pending
     local env, gameObject, storage = ctx.env, ctx.game, ctx.storage
     local clock = ctx.clock or os.clock
     local createdAt = clock()
@@ -43,7 +51,10 @@ local function createGameplayRecorder(ctx)
     -- immutable references, enriched outside the game's __namecall stack. Lua
     -- tables are copied now so later gameplay mutations cannot rewrite the log.
     local function snapshotArguments(...)
-        local remainingNodes, remainingStrings = MAX_NODES, MAX_STRINGS
+        -- Reserve identity space so a large argument cannot hide its remote.
+        local reservedNodes = math.min(16, math.floor(MAX_NODES / 4))
+        local reservedStrings = math.min(512, math.floor(MAX_STRINGS / 4))
+        local remainingNodes, remainingStrings = MAX_NODES - reservedNodes, MAX_STRINGS - reservedStrings
         local seen, deferred, nextId = {}, {}, 0
         local encode
         encode = function(value, depth)
@@ -96,13 +107,14 @@ local function createGameplayRecorder(ctx)
         local result = { n = n, values = {} }
         for index = 1, math.min(n, MAX_ARGUMENTS) do result.values[index] = encode(select(index, ...), 0) end
         if n > MAX_ARGUMENTS then result.truncated = true end
-        return result, deferred
+        return result, deferred, { nodes = remainingNodes + reservedNodes, strings = remainingStrings + reservedStrings }
     end
 
     -- Each event has its own combined node and string budget. Tables use entries
     -- so numeric/non-string keys, holes, nil arguments and references survive JSON.
-    local function serializer()
-        local remainingNodes, remainingStrings = MAX_NODES, MAX_STRINGS
+    local function serializer(budget)
+        local remainingNodes = budget and budget.nodes or MAX_NODES
+        local remainingStrings = budget and budget.strings or MAX_STRINGS
         local seen, nextId = {}, 0
         local encode
         local function text(value)
@@ -116,17 +128,16 @@ local function createGameplayRecorder(ctx)
         end
         local function instance(value, depth)
             local segments, cursor, truncated = {}, value, false
+            -- Identity fields get priority over the optional hierarchy segments.
+            local result = { type = "Instance", path = encode(value:GetFullName(), depth + 1),
+                segments = segments, class = encode(value.ClassName, depth + 1) }
             for _ = 1, 32 do
                 if not cursor or cursor == gameObject then break end
                 if remainingNodes <= 0 then truncated = true; break end
                 table.insert(segments, 1, encode(cursor.Name, depth + 1))
                 cursor = cursor.Parent
             end
-            local result = { type = "Instance", path = encode(value:GetFullName(), depth + 1),
-                segments = segments, class = encode(value.ClassName, depth + 1) }
             if truncated or (cursor and cursor ~= gameObject) then result.pathTruncated = true end
-            local ok, attributes = pcall(function() return value:GetAttributes() end)
-            if ok and type(attributes) == "table" then result.attributes = encode(attributes, depth + 1) end
             return result
         end
         local knownStringTypes = {
@@ -227,18 +238,21 @@ local function createGameplayRecorder(ctx)
         end
         return filter == "" or target:GetFullName():lower():find(filter, 1, true) ~= nil
     end
-    function sink.begin(target, method, ...)
-        if not recording or destroyed or typeof(target) ~= "Instance"
-            or (method ~= "FireServer" and method ~= "InvokeServer") then return nil end
-        if queueCount >= MAX_PENDING then queueDropped += 1; return nil end
-        local args, deferred = snapshotArguments(...)
+    local function enqueue(target, method, direction, ...)
+        if queueCount >= MAX_PENDING then queueDropped += 1; return end
+        local args, deferred, budget = snapshotArguments(...)
         queue[(queueHead + queueCount - 1) % MAX_PENDING + 1] = {
-            target = target, method = method, args = args, deferred = deferred,
+            target = target, method = method, direction = direction, args = args, deferred = deferred, budget = budget,
             generation = generation, label = label, time = safeTime(),
         }
         queueCount += 1
-        -- A resident v1 hook also tails original when this is nil. Never create a
-        -- response ticket: intercepting InvokeServer results changes its stack.
+    end
+    function sink.begin(target, method, ...)
+        if not recording or destroyed or typeof(target) ~= "Instance"
+            or (method ~= "FireServer" and method ~= "InvokeServer") then return nil end
+        enqueue(target, method, "outgoing", ...)
+        -- Older resident hooks also tail original when this is nil. Never issue
+        -- response tickets: wrapping InvokeServer results changes its stack.
         return nil
     end
 
@@ -257,7 +271,7 @@ local function createGameplayRecorder(ctx)
                 -- snapshot discards only this entry, never a game call.
                 pcall(function()
                     if not matches(raw.target, raw.method) then return end
-                    local encode = serializer()
+                    local encode = serializer(raw.budget)
                     local function materialize(value)
                         if type(value) ~= "table" then return value end
                         local engineValue = raw.deferred[value]
@@ -265,14 +279,14 @@ local function createGameplayRecorder(ctx)
                         for key, item in next, value do value[key] = materialize(item) end
                         return value
                     end
-                    local entry = { kind = "remote", direction = "outgoing", method = raw.method,
+                    local entry = { kind = "remote", direction = raw.direction, method = raw.method,
                         label = raw.label, time = raw.time, remote = encode(raw.target, 0),
-                        args = materialize(raw.args), status = "observed", metadataTiming = "deferred" }
+                        args = materialize(raw.args), status = raw.direction == "incoming" and "received" or "observed", metadataTiming = "deferred" }
                     if type(ctx.context) == "function" then
                         local ok, value = pcall(ctx.context)
                         if ok and value ~= nil then entry.context = encode(value, 0) end
                     end
-                    outgoing += 1
+                    if raw.direction == "incoming" then incoming += 1 else outgoing += 1 end
                     push(entry)
                 end)
             end
@@ -290,14 +304,8 @@ local function createGameplayRecorder(ctx)
         if incomingConnections[instance] or not (instance:IsA("RemoteEvent") or instance:IsA("UnreliableRemoteEvent")) then return end
         incomingConnections[instance] = instance.OnClientEvent:Connect(function(...)
             if not recording or not includeIncoming or not attachedBus or rawget(attachedBus, "sink") ~= sink then return end
-            local captured = table.pack(...)
-            pcall(function()
-                if not matches(instance, "OnClientEvent") then return end
-                local encode, args = serializer()
-                incoming += 1
-                push({ kind = "remote", direction = "incoming", method = "OnClientEvent",
-                    remote = encode(instance, 0), args = args(table.unpack(captured, 1, captured.n)), status = "received" })
-            end)
+            -- Incoming callbacks share the same bounded queue and deferred work.
+            pcall(enqueue, instance, "OnClientEvent", "incoming", ...)
         end)
     end
     local function syncIncoming()
@@ -318,7 +326,7 @@ local function createGameplayRecorder(ctx)
         if typeof(storage) ~= "Instance" or not storage:IsA("ReplicatedStorage") then return false, "ReplicatedStorage is unavailable." end
         local bus = rawget(env, BUS_KEY)
         if bus ~= nil and (type(bus) ~= "table"
-            or (rawget(bus, "version") ~= VERSION and rawget(bus, "version") ~= LEGACY_VERSION)
+            or not compatible[rawget(bus, "version")]
             or rawget(bus, "installed") ~= true) then
             return false, "An incompatible gameplay recorder hook is already installed."
         end
@@ -349,9 +357,11 @@ local function createGameplayRecorder(ctx)
                 return original(target, ...)
             end
             local callback = intercept
-            if type(makeClosure) == "function" then
+            if ctx.useCClosure == true then
+                if type(makeClosure) ~= "function" then return false, "Requested C closure capability is unavailable." end
                 local ok, closure = pcall(makeClosure, intercept)
-                if ok and type(closure) == "function" then callback = closure end
+                if not ok or type(closure) ~= "function" then return false, "Could not create the requested C closure." end
+                callback = closure
             end
             local ok, previous = pcall(hook, gameObject, "__namecall", callback)
             if not ok then return false, "Could not install a pass-through hook: " .. tostring(previous) end
@@ -430,13 +440,150 @@ local function createGameplayRecorder(ctx)
         return { recording = recording and attachedBus ~= nil and rawget(attachedBus, "sink") == sink,
             destroyed = destroyed, count = count, total = total, dropped = dropped, elapsed = safeTime(),
             outgoing = outgoing, incoming = incoming, interactions = interactions, returns = returns, errors = errors,
-            queued = queueCount, queueDropped = queueDropped, captureMode = "arguments-only",
+            queued = queueCount, queueDropped = queueDropped, captureMode = "arguments-only", limits = table.clone(limits),
             lastSequence = sequence, label = label, includeIncoming = includeIncoming, allReplicated = allReplicated, filter = filter }
     end
     return recorder
 end
 
 return createGameplayRecorder
+
+end)()
+
+local createRecorderJournal = (function()
+-- Durable local JSON-lines journal. Call Start before enabling the recorder and
+-- Append only from its deferred onRecord callback, never inside a namecall hook.
+local function createRecorderJournal(ctx)
+    local journal = {}
+    local baseFile = tostring(ctx.baseName or "karinderya-gameplay") .. ".log"
+    local chunked = type(ctx.appendfile) ~= "function"
+    local initialized, failed, saved, lastFile, lastError = false, false, 0, nil, nil
+    local metadata = type(ctx.metadata) == "table" and ctx.metadata or {}
+    local sessionId = metadata.sessionId or metadata.session or ctx.baseName
+    local limit = tonumber(ctx.maxLineBytes) or 24 * 1024
+    if limit ~= limit or limit == math.huge or limit == -math.huge then limit = 24 * 1024 end
+    limit = math.max(1024, math.floor(limit))
+
+    local function fail(reason)
+        failed, lastError = true, reason
+        return false, reason
+    end
+    local function encode(value)
+        local ok, result = pcall(ctx.encode, value)
+        if not ok or type(result) ~= "string" or result:find("[\r\n]") then return nil end
+        return result
+    end
+    local function boundedString(value, maximum)
+        if type(value) ~= "string" then return nil end
+        local result = value:sub(1, maximum)
+        -- Keep the compact JSON payload valid even when a UTF-8 character straddles
+        -- the size boundary. Captured recorder strings are already UTF-8-safe.
+        while #result > 0 and utf8.len(result) == nil do result = result:sub(1, -2) end
+        return result
+    end
+    local function finite(value)
+        return type(value) == "number" and value == value and value > -math.huge and value < math.huge
+    end
+    local function compact(event, small)
+        local remote = event.remote
+        if type(remote) == "table" then
+            remote = {
+                type = boundedString(remote.type, 24),
+                path = boundedString(remote.path, small and 32 or 256),
+                class = boundedString(remote.class, 48),
+            }
+        else
+            remote = boundedString(remote, small and 32 or 256)
+        end
+        return {
+            sequence = finite(event.sequence) and event.sequence or saved + 1,
+            time = finite(event.time) and event.time or nil,
+            kind = boundedString(event.kind, 32),
+            direction = boundedString(event.direction, 24),
+            label = boundedString(event.label, small and 16 or 96),
+            method = boundedString(event.method, 32),
+            remote = remote,
+            truncated = true, reason = "event too large",
+            args = { type = "truncated", truncated = true, reason = "event too large" },
+        }
+    end
+    local function envelope(event)
+        return { kind = "event", sessionId = sessionId, event = event }
+    end
+
+    function journal:Start()
+        if failed then return false, lastError end
+        if initialized then return true end
+        if type(ctx.writefile) ~= "function" then return fail("File writing is unavailable; recording was not started.") end
+        if type(ctx.encode) ~= "function" then return fail("Log encoding is unavailable; recording was not started.") end
+        -- The caller supplies a new session base name. If readfile is available,
+        -- also refuse an accidental collision with an existing session log.
+        if type(ctx.readfile) == "function" then
+            local exists, contents = pcall(ctx.readfile, baseFile)
+            if exists and type(contents) == "string" then return fail("A session log already exists; choose a new session filename.") end
+        end
+        local header = {
+            format = "karinderya-gameplay-journal-v1", kind = "session",
+            sessionId = sessionId, metadata = metadata, chunked = chunked,
+        }
+        if chunked then
+            header.partsPattern = tostring(ctx.baseName) .. "-event*.log"
+            header.note = "Each event is saved immediately in an immutable numbered part. Send this header and every matching event file."
+        else
+            header.note = "Events are appended immediately as JSON lines; no manual Save is required."
+        end
+        local payload = encode(header)
+        if not payload then return fail("Could not encode the session log header; recording was not started.") end
+        if #payload + 1 > limit then return fail("Session log metadata exceeds the line limit; recording was not started.") end
+        local ok, result = pcall(ctx.writefile, baseFile, payload .. "\n")
+        if not ok or result == false then return fail("Could not create the session log; recording was not started.") end
+        initialized, lastFile = true, baseFile
+        return true
+    end
+
+    function journal:Append(event)
+        if failed then return false, lastError end
+        if not initialized then return false, "Start the session log before recording." end
+        if type(event) ~= "table" then return fail("Could not encode a recorded event; recording has been paused.") end
+        local payload = encode(envelope(event))
+        if not payload then return fail("Could not encode a recorded event; recording has been paused.") end
+        if #payload + 1 > limit then
+            payload = encode(envelope(compact(event, false)))
+            if payload and #payload + 1 > limit then payload = encode(envelope(compact(event, true))) end
+            if not payload or #payload + 1 > limit then
+                return fail("Could not encode a bounded recorded event; recording has been paused.")
+            end
+        end
+        local filename = chunked and (tostring(ctx.baseName) .. string.format("-event%06d.log", saved + 1)) or baseFile
+        -- A failed append may have written a partial line. Latch the error rather
+        -- than retrying and duplicating an event or overwriting a partial part.
+        local ok, result
+        if chunked then ok, result = pcall(ctx.writefile, filename, payload .. "\n")
+        else ok, result = pcall(ctx.appendfile, filename, payload .. "\n") end
+        if not ok or result == false then return fail("Could not save a recorded event; recording has been paused. Earlier saved logs remain on disk.") end
+        saved, lastFile = saved + 1, filename
+        return true
+    end
+
+    function journal:Stats()
+        return { initialized = initialized, failed = failed, saved = saved, lastFile = lastFile,
+            baseFile = baseFile, chunked = chunked, lastError = lastError }
+    end
+
+    function journal:GetLog()
+        if not initialized then return nil, "No session log has been created." end
+        if chunked then return nil, "This session uses numbered event files; send the header and all matching parts." end
+        if type(ctx.readfile) ~= "function" then return nil, "Reading saved log files is unavailable in this executor." end
+        local ok, result = pcall(ctx.readfile, baseFile)
+        if not ok or type(result) ~= "string" then return nil, "Could not read the saved session log." end
+        return result
+    end
+
+    function journal:Close() end -- Every successful Append is already on disk.
+    return journal
+end
+
+return createRecorderJournal
 
 end)()
 
@@ -543,6 +690,10 @@ local function createRecorderDashboard(api)
         if type(api[method]) ~= "function" then status.Text = "Unavailable action: " .. method; return nil end
         local ok, result = pcall(api[method], api, ...)
         if not ok then status.Text = tostring(result); return nil end
+        if method == "SaveLog" or method == "Export" then
+            status.Text = type(result) == "string" and ("Log file: " .. result) or "No local log file is available."
+            return result -- Do not copy live event tables or rebuild rows for this button.
+        end
         if alive and method ~= "Destroy" then
             local gotState, snapshot = pcall(api.GetState, api)
             if gotState and type(snapshot) == "table" then dashboard:Refresh(snapshot) end
@@ -583,7 +734,7 @@ local function createRecorderDashboard(api)
     local controls = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 1 }, capture)
     local run = button(controls, "START RECORDING", function() invoke(state.recording and "Stop" or "Start") end, true)
     run.Size = UDim2.new(0.46, -4, 1, 0)
-    local export = button(controls, "SAVE LOG", function() invoke(type(api.SaveLog) == "function" and "SaveLog" or "Export") end)
+    local export = button(controls, "SHOW LOG FILE", function() invoke(type(api.SaveLog) == "function" and "SaveLog" or "Export") end)
     export.Position, export.Size = UDim2.new(0.46, 4, 0, 0), UDim2.new(0.34, -8, 1, 0)
     local options = card("RECORDING OPTIONS", 2)
     options.Visible = false
@@ -606,7 +757,7 @@ local function createRecorderDashboard(api)
     metrics.LayoutOrder, metrics.Size, metrics.AutomaticSize = 2, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
     local savedFile = label(capture, "Save log writes a .log file you can send here.", 10, C.muted)
     savedFile.LayoutOrder, savedFile.Size, savedFile.AutomaticSize = 3, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
-    local modeHint = label(capture, "Compatibility mode: outgoing arguments only. Inspection runs outside game calls.", 10, C.muted)
+    local modeHint = label(capture, "Recovery mode: log created before recording; captured calls save automatically.", 10, C.muted)
     modeHint.LayoutOrder, modeHint.Size, modeHint.AutomaticSize = 4, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
     local optionSetters = {}
     local function option(text, method, key, order)
@@ -624,7 +775,6 @@ local function createRecorderDashboard(api)
     end
     option("Include incoming server events", "SetIncludeIncoming", "includeIncoming", 3)
     option("Scan all ReplicatedStorage remotes", "SetAllReplicated", "allReplicated", 4)
-    option("Continuously save the recording to a local log", "SetAutosave", "autosave", 5)
     local filterBox = input(options, "Optional remote path/name filter; blank captures all in scope")
     filterBox.LayoutOrder = 6
     connect(filterBox.FocusLost, function() invoke("SetFilter", filterBox.Text) end)
@@ -693,9 +843,9 @@ local function createRecorderDashboard(api)
         if not taskLabel:IsFocused() then taskLabel.Text = tostring(state.label or "") end
         if not filterBox:IsFocused() then filterBox.Text = tostring(state.filter or "") end
         for key, set in pairs(optionSetters) do set(state[key]) end
-        metrics.Text = string.format("%s events  /  %s outgoing  /  %s incoming  /  %s interactions  /  %s returns  /  %ss  /  %s dropped",
-            tostring(state.count or 0), tostring(state.outgoing or 0), tostring(state.incoming or 0),
-            tostring(state.interactions or 0), tostring(state.returns or 0), tostring(math.floor(tonumber(state.elapsed) or 0)), tostring(state.dropped or 0))
+        metrics.Text = string.format("%s saved  /  %s in live window  /  %s outgoing  /  %s incoming  /  %ss  /  %s left window or skipped",
+            tostring(state.saved or 0), tostring(state.count or 0), tostring(state.outgoing or 0), tostring(state.incoming or 0),
+            tostring(math.floor(tonumber(state.elapsed) or 0)), tostring(state.dropped or 0))
         local events, retained, added = state.events or {}, {}, false
         for index = math.max(1, #events - 29), #events do
             local event = events[index]
@@ -801,14 +951,12 @@ return createRecorderDashboard
 
 end)()
 
--- Manual gameplay recorder runtime; bundled by build_recorder.py.
+-- Minimal recorder runtime. Journal is created before the remote hook starts.
 if not game:IsLoaded() then game.Loaded:Wait() end
 local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
 local Storage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local Input = game:GetService("UserInputService")
-local PromptService = game:GetService("ProximityPromptService")
 local player = assert(Players.LocalPlayer, "Run this recorder in the Roblox client.")
 local env = type(getgenv) == "function" and getgenv() or _G
 local previous = env.KarinderyaGameplayRecorder
@@ -820,347 +968,184 @@ if type(automation) == "table" then
 end
 
 local alive, engine, dashboard = true, nil, nil
-local connections, watched = {}, setmetatable({}, { __mode = "k" })
-local status, label = "Ready. Enter an action label, then Start recording.", "Gameplay"
-local cachedContext, pending, pendingDropped = {}, {}, 0
+local status, label = "Preparing local log...", "Gameplay"
 local preview, previewCursor = {}, 0
-local lastFlush, flushing, fileInitialized = 0, false, false
-local savedEvents, part = 0, 0
-local lastQueueDropped = 0
-local fileWrite = env.writefile or writefile
-local fileAppend = env.appendfile or appendfile
-local fileRead = env.readfile or readfile
+local storageError, lastQueueDropped = nil, 0
 local clipboard = env.setclipboard or setclipboard
-local autosave = type(fileWrite) == "function"
 local sessionId = HttpService:GenerateGUID(false)
 local baseName = "karinderya-gameplay-" .. sessionId
-local lastExport = ""
+local metadata = { format = "karinderya-gameplay-recording", version = 3, sessionId = sessionId,
+    placeId = game.PlaceId, playerUserId = player.UserId, capturedAtUTC = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    captureMode = "minimal-arguments-only", persistence = "immediate writes outside remote hook" }
 local api = {}
 env.KarinderyaGameplayRecorder = api
-
-local function connect(signal, callback, bucket)
-    local connection = signal:Connect(callback)
-    table.insert(bucket or connections, connection)
-    return connection
-end
-local function message(text)
-    status = tostring(text)
+local function message(value)
+    status = tostring(value)
     print("[Karinderya Recorder] " .. status)
 end
-local function active()
-    return alive and engine and engine:Stats().recording
+local journal = createRecorderJournal({ writefile = env.writefile or writefile,
+    appendfile = env.appendfile or appendfile, readfile = env.readfile or readfile,
+    encode = function(value) return HttpService:JSONEncode(value) end,
+    metadata = metadata, baseName = baseName, maxLineBytes = 24 * 1024 })
+local prepared, preparationError = journal:Start()
+if prepared then
+    message("Log ready: " .. journal:Stats().baseFile .. ". Start recording when ready.")
+else
+    storageError = preparationError or "Could not create a log file."
+    message("Recording paused: " .. storageError)
 end
-local function simpleAttributes(instance)
-    local attributes, count = {}, 0
-    for key, value in pairs(instance:GetAttributes()) do
-        if count >= 32 then break end
-        local kind = typeof(value)
-        if kind == "string" then attributes[key] = value:sub(1, 256)
-        elseif kind == "boolean" or kind == "number" then attributes[key] = value
-        else attributes[key] = tostring(value):sub(1, 128) end
-        count += 1
-    end
-    return attributes
-end
-local function sampleContext()
-    local context = {}
-    local model = player.Character
-    local root = model and model:FindFirstChild("HumanoidRootPart")
-    if model then
-        local tool = model:FindFirstChildOfClass("Tool")
-        context.equippedTool = tool and tool.Name or nil
-    end
-    if root then
-        context.position = { x = root.Position.X, y = root.Position.Y, z = root.Position.Z }
-        context.cframe = { root.CFrame:GetComponents() }
-        local folder = Workspace:FindFirstChild("ClientNPCs")
-        local nearest, distance = nil, 24
-        if folder then
-            for i, npc in ipairs(folder:GetChildren()) do
-                if i > 80 then break end
-                local part = npc:FindFirstChild("HumanoidRootPart")
-                if part then
-                    local current = (part.Position - root.Position).Magnitude
-                    if current < distance then nearest, distance = npc, current end
-                end
-            end
-        end
-        if nearest then context.nearbyCustomer = { path = nearest:GetFullName(), attributes = simpleAttributes(nearest) } end
-    end
-    local stats = player:FindFirstChild("leaderstats")
-    local cash = player:GetAttribute("Cash")
-    if cash == nil and stats then
-        local value = stats:FindFirstChild("Cash") or stats:FindFirstChild("Money")
-        if value and value:IsA("ValueBase") then cash = value.Value end
-    end
-    if type(cash) == "number" then context.cash = cash end
-    cachedContext = context
-    return context
-end
-local function metadata()
-    return { format = "karinderya-gameplay-recording", version = 1, sessionId = sessionId, placeId = game.PlaceId,
-        playerUserId = player.UserId, capturedAtUTC = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        captureMode = "arguments-only", purpose = "manual gameplay observation; no remote replay" }
-end
-
-local function flush()
-    if flushing or not autosave or #pending == 0 or type(fileWrite) ~= "function" then return end
-    flushing = true
-    local batch = pending
-    pending = {}
-    local ok, reason = pcall(function()
-        if type(fileAppend) == "function" then
-            local lines = {}
-            if not fileInitialized then
-                fileWrite(baseName .. ".log", HttpService:JSONEncode({ kind = "session", metadata = metadata() }) .. "\n")
-                fileInitialized = true
-            end
-            for _, event in ipairs(batch) do table.insert(lines, HttpService:JSONEncode(event)) end
-            fileAppend(baseName .. ".log", table.concat(lines, "\n") .. "\n")
-            lastExport = baseName .. ".log"
-        else
-            part += 1
-            local filename = baseName .. string.format("-part%04d.log", part)
-            fileWrite(filename, HttpService:JSONEncode({ metadata = metadata(), events = batch }))
-            lastExport = filename
-        end
-        savedEvents += #batch
-    end)
-    if not ok then
-        -- Keep the unflushed data for a retry; cap the queue instead of growing forever.
-        local restored = {}
-        for _, event in ipairs(batch) do if #restored < 1000 then table.insert(restored, event) else pendingDropped += 1 end end
-        for _, event in ipairs(pending) do if #restored < 1000 then table.insert(restored, event) else pendingDropped += 1 end end
-        pending = restored
-        autosave = false
-        message("Autosave failed. Data remains in memory; use Export. " .. tostring(reason):sub(1, 120))
-    end
-    flushing = false
-    lastFlush = os.clock()
-end
-
 engine = createGameplayRecorder({ env = env, game = game, storage = Storage, clock = os.clock,
-    context = function() return cachedContext end,
     onRecord = function(event)
-        if autosave then
-            if #pending < 1000 then table.insert(pending, event) else pendingDropped += 1 end
-        end
+        if storageError then return end
+        local ok, reason = journal:Append(event)
+        if not ok then storageError = reason or "The log could not be written." end
     end })
 engine:SetIncludeIncoming(false)
 engine:SetLabel(label)
 
+local function active()
+    return alive and engine:Stats().recording
+end
+local function checkStorage()
+    if storageError then
+        engine:Stop()
+        message("Recording stopped: " .. storageError .. ". Existing saved log data is retained.")
+        return false
+    end
+    return true
+end
 function api:Start()
-    if not alive then return false end
+    if not alive or not checkStorage() then return false end
+    local stats = journal:Stats()
+    if not stats.initialized or stats.failed then message("A working file writer is required before recording."); return false end
     local ok, reason = engine:Start()
-    if ok then
-        sampleContext()
-        engine:Note("session-state", { action = "start", context = cachedContext })
-        message("Recording outgoing arguments in compatibility mode. Play normally, then Save Log.")
-    else message("Recording unavailable: " .. tostring(reason)) end
-    return ok
+    if not ok then message("Recording unavailable: " .. tostring(reason)); return false end
+    engine:Note("session-state", { action = "start", mode = "minimal" })
+    if not checkStorage() then return false end
+    message("Recording. Calls are saved automatically; Save Log shows the file to send.")
+    return true
 end
 function api:Stop()
     if not alive then return end
-    engine:Stop()
-    flush()
-    message("Paused. Export the session when finished.")
+    engine:Stop() -- drains the remaining queue into the journal
+    if checkStorage() then message("Paused. Log saved: " .. journal:Stats().baseFile) end
 end
 function api:SetLabel(value)
     label = tostring(value or ""):gsub("[%c]", " "):sub(1, 120)
     if label == "" then label = "Gameplay" end
     engine:SetLabel(label)
-    message("Current action: " .. label)
 end
 function api:Mark(value)
     if value and value ~= "" then self:SetLabel(value) end
     if not active() then message("Start recording before adding a marker."); return false end
-    sampleContext()
     engine:Flush()
     engine:Mark(label)
-    engine:Note("checkpoint", { context = cachedContext })
-    message("Marked: " .. label .. ". Perform that action now.")
-    return true
+    return checkStorage()
 end
 function api:Clear()
-    if active() then self:Stop() end
-    flush()
+    self:Stop()
     engine:Clear()
     table.clear(preview)
     previewCursor = engine:Stats().lastSequence
-    message("Cleared the live window. Existing autosave files are retained.")
+    lastQueueDropped = 0
+    message("Live window cleared. Saved log records are retained.")
 end
 function api:SetIncludeIncoming(value)
     engine:SetIncludeIncoming(value == true)
 end
 function api:SetAllReplicated(value)
     engine:SetAllReplicated(value == true)
-    message(value and "Capturing matching remotes throughout ReplicatedStorage." or "Capturing matching remotes under ReplicatedStorage.Remotes.")
 end
 function api:SetFilter(value)
     engine:SetFilter(tostring(value or ""):sub(1, 160))
 end
-function api:SetAutosave(value)
-    if value and type(fileWrite) ~= "function" then message("This executor does not provide writefile."); return false end
-    autosave = value == true
-    if autosave then
-        if #pending == 0 and savedEvents == 0 then
-            for _, event in ipairs(engine:Entries()) do table.insert(pending, event) end
-        end
-        flush()
-    end
-    return autosave
-end
-local function eventBySequence(sequence)
-    for _, event in ipairs(engine:Entries()) do if event.sequence == sequence then return event end end
-    return nil
+function api:SetAutosave()
+    message("Automatic saving stays on in this recovery build.")
+    return true
 end
 function api:Inspect(sequence)
-    local event = eventBySequence(sequence)
-    return event and HttpService:JSONEncode(event) or "This event has left the live window; check the autosave file."
+    for _, event in ipairs(engine:Entries()) do
+        if event.sequence == sequence then return HttpService:JSONEncode(event) end
+    end
+    return "This event left the small live window. Its saved copy remains in the log."
 end
 function api:CopyEvent(sequence)
     local text = self:Inspect(sequence)
     if type(clipboard) == "function" then pcall(clipboard, text) end
     return text
 end
-function api:Export()
-    engine:Flush()
-    flush()
-    local snapshot = { metadata = metadata(), stats = engine:Stats(), events = engine:Entries(),
-        savedEvents = savedEvents, autosaveQueueDropped = pendingDropped, autosaveFile = fileInitialized and baseName .. ".log" or nil,
-        note = "Events contains the retained live window. Autosave files preserve older events." }
-    local json = HttpService:JSONEncode(snapshot)
-    self.LastExport = json
-    local copied, saved = false, false
-    local completeFile = autosave and fileInitialized and #pending == 0 and pendingDropped == 0 and type(fileAppend) == "function"
-    local clipboardText = json
-    if completeFile and type(fileRead) == "function" then
-        local readOK, fullLog = pcall(fileRead, baseName .. ".log")
-        if readOK and type(fullLog) == "string" then clipboardText = fullLog end
-    end
-    if type(clipboard) == "function" then copied = pcall(clipboard, clipboardText) end
-    if completeFile then
-        saved = true
-        lastExport = baseName .. ".log"
-    elseif type(fileWrite) == "function" then
-        local path = baseName .. "-window.log"
-        saved = pcall(fileWrite, path, json)
-        if saved then lastExport = path end
-    end
-    if not copied and not saved then print(json) end
-    message(saved and ("Log saved: " .. lastExport .. ". Send that file here.")
-        or ("Captured " .. #snapshot.events .. " events" .. (copied and " to clipboard." or " in the console.")))
-    return json
-end
 function api:SaveLog()
-    return self:Export()
+    local stats = journal:Stats()
+    if not stats.initialized then
+        message("No local log was created. " .. tostring(stats.lastError or storageError or "File writer unavailable."))
+        return nil
+    end
+    -- Display only: no queue drain, encoding, clipboard, or file access on click.
+    self.LastExport = stats.baseFile
+    message(stats.chunked and ("Send " .. stats.baseFile .. " and all matching -event*.log files.")
+        or ((stats.failed and "Partial log: " or "Log is already saved: ") .. stats.baseFile .. ". Send that file here."))
+    return stats.baseFile
 end
+function api:Export() return self:SaveLog() end
 function api:GetState()
     local stats = engine:Stats()
-    local events = engine:Entries(previewCursor)
-    for _, event in ipairs(events) do
-        local remote = event.remote
-        local name = remote and remote.path or event.kind
-        if type(name) ~= "string" then name = event.kind end
-        table.insert(preview, { sequence = event.sequence, time = event.time or event.elapsed or 0, kind = event.kind,
-            direction = event.direction, name = name, label = event.label,
-            summary = event.status or event.kind })
-        if #preview > 30 then table.remove(preview, 1) end
+    for _, event in ipairs(engine:Entries(previewCursor)) do
+        local name = event.remote and event.remote.path
+        table.insert(preview, { sequence = event.sequence, time = event.time or 0, kind = event.kind,
+            direction = event.direction, name = type(name) == "string" and name or event.kind,
+            label = event.label, summary = event.status or event.kind })
+        if #preview > 10 then table.remove(preview, 1) end
         previewCursor = math.max(previewCursor, event.sequence)
     end
+    local disk = journal:Stats()
     return { recording = stats.recording, label = label, status = status, count = stats.count,
-        dropped = stats.dropped + (stats.queueDropped or 0), elapsed = stats.elapsed, outgoing = stats.outgoing, incoming = stats.incoming,
-        interactions = stats.interactions, returns = stats.returns, includeIncoming = stats.includeIncoming,
-        allReplicated = stats.allReplicated, filter = stats.filter, autosave = autosave, lastExport = lastExport,
-        events = table.clone(preview) }
+        dropped = stats.dropped + (stats.queueDropped or 0), elapsed = stats.elapsed,
+        outgoing = stats.outgoing, incoming = stats.incoming, interactions = stats.interactions, returns = 0,
+        includeIncoming = stats.includeIncoming, allReplicated = stats.allReplicated, filter = stats.filter,
+        autosave = disk.initialized and not disk.failed, lastExport = disk.initialized and disk.baseFile or "",
+        saved = disk.saved, events = table.clone(preview) }
 end
 function api:Destroy()
     if not alive then return end
     engine:Stop()
-    flush()
     alive = false
     engine:Destroy()
-    for _, connection in ipairs(connections) do connection:Disconnect() end
-    for _, list in pairs(watched) do for _, connection in ipairs(list) do connection:Disconnect() end end
-    table.clear(connections)
-    table.clear(watched)
+    if self.inputConnection then self.inputConnection:Disconnect() end
     if dashboard then dashboard:Destroy() end
     if env.KarinderyaGameplayRecorder == self then env.KarinderyaGameplayRecorder = nil end
 end
-
-local function note(kind, details)
-    if active() then engine:Note(kind, details) end
-end
-local function watch(instance)
-    if watched[instance] then return end
-    if instance:IsA("GuiButton") then
-        if instance:FindFirstAncestor("KarinderyaRecorderDashboard") or instance:FindFirstAncestor("KarinderyaDashboard") then return end
-        local list = {}
-        watched[instance] = list
-        connect(instance.Activated, function()
-            if not active() then return end
-            note("gui-click", { path = instance:GetFullName(), class = instance.ClassName,
-                text = instance:IsA("TextButton") and instance.Text:sub(1, 160) or instance.Name })
-        end, list)
-    elseif instance:IsA("Tool") and (instance:IsDescendantOf(player.Backpack) or (player.Character and instance:IsDescendantOf(player.Character))) then
-        local list = {}
-        watched[instance] = list
-        connect(instance.Activated, function() note("tool-activated", { path = instance:GetFullName(), name = instance.Name }) end, list)
-    end
-end
-local playerGui = player:WaitForChild("PlayerGui")
-connect(playerGui.DescendantAdded, watch)
-connect(playerGui.DescendantRemoving, function(instance)
-    local list = watched[instance]
-    if list then for _, connection in ipairs(list) do connection:Disconnect() end; watched[instance] = nil end
-end)
-connect(player.Backpack.DescendantAdded, watch)
-local function characterAdded(model)
-    connect(model.DescendantAdded, watch)
-    for _, instance in ipairs(model:GetDescendants()) do watch(instance) end
-    note("character-spawned", { name = model.Name })
-end
-connect(player.CharacterAdded, characterAdded)
-if player.Character then characterAdded(player.Character) end
-connect(PromptService.PromptTriggered, function(prompt, who)
-    if who and who ~= player then return end
-    if not active() then return end
-    note("prompt-triggered", { path = prompt:GetFullName(), action = prompt.ActionText, object = prompt.ObjectText,
-        holdDuration = prompt.HoldDuration, distance = prompt.MaxActivationDistance,
-        parentAttributes = prompt.Parent and simpleAttributes(prompt.Parent) or {} })
-end)
-connect(Input.InputBegan, function(input, processed)
+api.inputConnection = Input.InputBegan:Connect(function(input, processed)
     if processed then return end
     if input.KeyCode == Enum.KeyCode.F7 then if active() then api:Stop() else api:Start() end end
     if input.KeyCode == Enum.KeyCode.F8 and dashboard then dashboard:Toggle() end
     if input.KeyCode == Enum.KeyCode.F9 then api:Mark() end
 end)
-for i, instance in ipairs(playerGui:GetDescendants()) do
-    if not alive then return api end
-    watch(instance)
-    if i % 400 == 0 then task.wait() end
-end
-for _, instance in ipairs(player.Backpack:GetDescendants()) do watch(instance) end
-if not alive then return api end
-sampleContext()
 dashboard = createRecorderDashboard(api)
 task.spawn(function()
     while alive do
-        local ok, err = pcall(function()
-            engine:Flush(48)
-            local stats = engine:Stats()
-            if (stats.queueDropped or 0) > lastQueueDropped then
-                lastQueueDropped = stats.queueDropped
-                message("Capture queue was busy; " .. lastQueueDropped .. " calls were skipped. Narrow the path filter if needed.")
-            end
-            if active() then sampleContext() end
-            if autosave and os.clock() - lastFlush > 5 then flush() end
-            if pendingDropped > 0 and active() then api:Stop(); message("Recording paused because autosave could not keep up. Export the retained data.") end
-            if dashboard then dashboard:Refresh(api:GetState()) end
-        end)
-        if not ok then message("Recorder display/export error: " .. tostring(err):sub(1, 160)) end
-        task.wait(0.5)
+        if active() then
+            local ok, reason = pcall(function()
+                engine:Flush(4) -- small batches, at most 0.1 seconds between drains
+                if not checkStorage() then return end
+                local stats = engine:Stats()
+                if (stats.queueDropped or 0) > lastQueueDropped then
+                    lastQueueDropped = stats.queueDropped
+                    engine:Stop()
+                    message("Capture paused after a traffic burst. Narrow the remote filter; saved records remain in the log.")
+                end
+            end)
+            if not ok then engine:Stop(); message("Recorder paused: " .. tostring(reason):sub(1, 160)) end
+        end
+        task.wait(0.1)
     end
 end)
-message("Ready. F7: record/pause, F8: show/hide, F9: mark current action.")
+task.spawn(function()
+    while alive do
+        if dashboard then
+            local ok, reason = pcall(function() dashboard:Refresh(api:GetState()) end)
+            if not ok then message("Display paused: " .. tostring(reason):sub(1, 160)); break end
+        end
+        task.wait(1)
+    end
+end)
 return api
