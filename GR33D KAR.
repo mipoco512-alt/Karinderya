@@ -1,20 +1,22 @@
--- Karinderya Gameplay Recorder. Read RECORDER.md before recording.
+-- Karinderya Gameplay Recorder v2 (argument-only compatibility mode). Read RECORDER.md.
 
 local createGameplayRecorder = (function()
--- Passive gameplay recorder. The one installed hook becomes inert after Stop().
--- A plain Luau closure allows InvokeServer to yield through pcall. Executors that
--- only accept C closures cannot use response recording; no C-closure fallback is
--- installed because it could change the game's yielding behavior.
+-- The hook only snapshots Lua arguments and forwards the original call directly.
+-- Instance methods, filtering, context and observers run later in Flush(). A
+-- nested Instance namecall must never replace the game's pending method name.
 local function createGameplayRecorder(ctx)
-    local BUS_KEY, VERSION = "__KarinderyaGameplayRecorderHook", "gameplay-recorder-v1"
+    local BUS_KEY, VERSION = "__KarinderyaGameplayRecorderHook", "gameplay-recorder-v2"
+    local LEGACY_VERSION = "gameplay-recorder-v1"
     local MAX_RECORDS, MAX_NODES, MAX_STRINGS = 1000, 512, 24 * 1024
     local MAX_DEPTH, MAX_ENTRIES, MAX_ARGUMENTS = 6, 64, 64
+    local MAX_PENDING = 256
     local env, gameObject, storage = ctx.env, ctx.game, ctx.storage
     local clock = ctx.clock or os.clock
     local createdAt = clock()
     local buffer, head, count, sequence = {}, 1, 0, 0
     local dropped, total, outgoing, incoming, interactions, returns, errors = 0, 0, 0, 0, 0, 0, 0
     local recording, destroyed, generation = false, false, 0
+    local queue, queueHead, queueCount, queueDropped, flushing = {}, 1, 0, 0, false
     local includeIncoming, allReplicated, filter, label = false, false, "", ""
     local attachedBus, addedConnection, removedConnection
     local incomingConnections = {}
@@ -35,6 +37,66 @@ local function createGameplayRecorder(ctx)
         if value == math.huge then return { type = "number", value = "+Infinity" } end
         if value == -math.huge then return { type = "number", value = "-Infinity" } end
         return value
+    end
+
+    -- Only pure Lua operations and typeof are allowed here. Engine values are
+    -- immutable references, enriched outside the game's __namecall stack. Lua
+    -- tables are copied now so later gameplay mutations cannot rewrite the log.
+    local function snapshotArguments(...)
+        local remainingNodes, remainingStrings = MAX_NODES, MAX_STRINGS
+        local seen, deferred, nextId = {}, {}, 0
+        local encode
+        encode = function(value, depth)
+            if remainingNodes <= 0 then return { type = "truncated", reason = "node budget" } end
+            remainingNodes -= 1
+            local kind = typeof(value)
+            if kind == "nil" then return { type = "nil" }
+            elseif kind == "boolean" then return value
+            elseif kind == "number" then return number(value)
+            elseif kind == "string" then
+                local size = #value
+                local limit = math.min(size, remainingStrings, 4096)
+                remainingStrings -= limit
+                if limit == size and utf8.len(value) ~= nil then return value end
+                local bytes = table.create(limit)
+                for index = 1, limit do bytes[index] = string.format("%02x", string.byte(value, index)) end
+                return { type = "string", encoding = "hex", value = table.concat(bytes), byteLength = size, truncated = limit < size }
+            elseif kind == "table" then
+                if seen[value] then return { type = "reference", id = seen[value] } end
+                if depth >= MAX_DEPTH then return { type = "table", truncated = true, reason = "depth limit" } end
+                nextId += 1
+                -- Deferred metadata uses positive table IDs; keep call-time Lua
+                -- tables in a distinct namespace within the same event.
+                local result = { type = "table", id = -nextId, entries = {} }
+                seen[value] = -nextId
+                local key, item = next(value)
+                while key ~= nil do
+                    if #result.entries >= MAX_ENTRIES or remainingNodes < 2 then
+                        result.truncated, result.reason = true, #result.entries >= MAX_ENTRIES and "entry limit" or "node budget"
+                        break
+                    end
+                    table.insert(result.entries, { key = encode(key, depth + 1), value = encode(item, depth + 1) })
+                    key, item = next(value, key)
+                end
+                return result
+            elseif kind == "Instance" or kind == "Vector3" or kind == "Vector2" or kind == "CFrame"
+                or kind == "Color3" or kind == "UDim" or kind == "UDim2" or kind == "NumberRange"
+                or kind == "Rect" or kind == "Ray" or kind == "DateTime" or kind == "EnumItem"
+                or kind == "BrickColor" or kind == "Axes" or kind == "Faces" or kind == "Font"
+                or kind == "ColorSequence" or kind == "ColorSequenceKeypoint" or kind == "NumberSequence"
+                or kind == "NumberSequenceKeypoint" or kind == "PhysicalProperties" or kind == "Region3"
+                or kind == "Region3int16" or kind == "Vector2int16" or kind == "Vector3int16" then
+                local token = {}
+                deferred[token] = value
+                return token
+            end
+            return { type = kind, unsupported = true }
+        end
+        local n = select("#", ...)
+        local result = { n = n, values = {} }
+        for index = 1, math.min(n, MAX_ARGUMENTS) do result.values[index] = encode(select(index, ...), 0) end
+        if n > MAX_ARGUMENTS then result.truncated = true end
+        return result, deferred
     end
 
     -- Each event has its own combined node and string budget. Tables use entries
@@ -139,7 +201,7 @@ local function createGameplayRecorder(ctx)
 
     local function push(entry)
         sequence += 1
-        entry.sequence, entry.time = sequence, safeTime()
+        entry.sequence, entry.time = sequence, entry.time or safeTime()
         entry.elapsed = entry.time
         entry.label = entry.label or label
         if count == MAX_RECORDS then
@@ -165,34 +227,58 @@ local function createGameplayRecorder(ctx)
         end
         return filter == "" or target:GetFullName():lower():find(filter, 1, true) ~= nil
     end
-    local function isAttached(ticket)
-        return recording and not destroyed and ticket.generation == generation
-            and attachedBus and rawget(attachedBus, "sink") == sink
-    end
     function sink.begin(target, method, ...)
-        if not recording or destroyed or not matches(target, method) then return nil end
-        local encode, args = serializer()
-        local entry = { kind = "remote", direction = "outgoing", method = method,
-            remote = encode(target, 0), args = args(...), status = method == "InvokeServer" and "invoked" or "observed" }
-        if type(ctx.context) == "function" then
-            local ok, value = pcall(ctx.context)
-            if ok and value ~= nil then entry.context = encode(value, 0) end
-        end
-        outgoing += 1
-        local ticket = { generation = generation, started = clock(), label = label, target = target }
-        ticket.sequence = push(entry)
-        return ticket
+        if not recording or destroyed or typeof(target) ~= "Instance"
+            or (method ~= "FireServer" and method ~= "InvokeServer") then return nil end
+        if queueCount >= MAX_PENDING then queueDropped += 1; return nil end
+        local args, deferred = snapshotArguments(...)
+        queue[(queueHead + queueCount - 1) % MAX_PENDING + 1] = {
+            target = target, method = method, args = args, deferred = deferred,
+            generation = generation, label = label, time = safeTime(),
+        }
+        queueCount += 1
+        -- A resident v1 hook also tails original when this is nil. Never create a
+        -- response ticket: intercepting InvokeServer results changes its stack.
+        return nil
     end
-    function sink.complete(ticket, success, ...)
-        if not isAttached(ticket) then return end
-        local encode, args = serializer()
-        local elapsed = clock() - ticket.started
-        local entry = { kind = "response", direction = "incoming", method = "InvokeServer", label = ticket.label,
-            remote = encode(ticket.target, 0), requestSequence = ticket.sequence,
-            status = success and "returned" or "error", duration = number(math.max(0, elapsed)) }
-        if success then entry.result = args(...) else entry.error = encode((...), 0); errors += 1 end
-        returns += 1
-        push(entry)
+
+    function recorder:Flush(limit)
+        if flushing or destroyed then return 0 end
+        flushing = true
+        local maximum = type(limit) == "number" and limit == limit and math.clamp(math.floor(limit), 0, MAX_PENDING) or MAX_PENDING
+        local processed = 0
+        for _ = 1, math.min(queueCount, maximum) do
+            local raw = queue[queueHead]
+            queue[queueHead] = nil
+            queueHead, queueCount = queueHead % MAX_PENDING + 1, queueCount - 1
+            processed += 1
+            if raw.generation == generation then
+                -- Metadata can disappear between the call and Flush. A failed
+                -- snapshot discards only this entry, never a game call.
+                pcall(function()
+                    if not matches(raw.target, raw.method) then return end
+                    local encode = serializer()
+                    local function materialize(value)
+                        if type(value) ~= "table" then return value end
+                        local engineValue = raw.deferred[value]
+                        if engineValue ~= nil then return encode(engineValue, 0) end
+                        for key, item in next, value do value[key] = materialize(item) end
+                        return value
+                    end
+                    local entry = { kind = "remote", direction = "outgoing", method = raw.method,
+                        label = raw.label, time = raw.time, remote = encode(raw.target, 0),
+                        args = materialize(raw.args), status = "observed", metadataTiming = "deferred" }
+                    if type(ctx.context) == "function" then
+                        local ok, value = pcall(ctx.context)
+                        if ok and value ~= nil then entry.context = encode(value, 0) end
+                    end
+                    outgoing += 1
+                    push(entry)
+                end)
+            end
+        end
+        flushing = false
+        return processed
     end
 
     local function disconnectIncoming()
@@ -231,39 +317,44 @@ local function createGameplayRecorder(ctx)
         if type(env) ~= "table" then return false, "A persistent executor environment is required." end
         if typeof(storage) ~= "Instance" or not storage:IsA("ReplicatedStorage") then return false, "ReplicatedStorage is unavailable." end
         local bus = rawget(env, BUS_KEY)
-        if bus ~= nil and (type(bus) ~= "table" or rawget(bus, "version") ~= VERSION or rawget(bus, "installed") ~= true) then
+        if bus ~= nil and (type(bus) ~= "table"
+            or (rawget(bus, "version") ~= VERSION and rawget(bus, "version") ~= LEGACY_VERSION)
+            or rawget(bus, "installed") ~= true) then
             return false, "An incompatible gameplay recorder hook is already installed."
         end
         if bus == nil then
             local hook = rawget(env, "hookmetamethod") or hookmetamethod
             local getMethod = rawget(env, "getnamecallmethod") or getnamecallmethod
             local checkCaller = rawget(env, "checkcaller") or checkcaller
+            local setMethod = rawget(env, "setnamecallmethod") or setnamecallmethod
+            local makeClosure = rawget(env, "newcclosure") or newcclosure
             if type(hook) ~= "function" or type(getMethod) ~= "function" or type(checkCaller) ~= "function" then
                 return false, "Needs hookmetamethod, getnamecallmethod and checkcaller."
             end
             bus = { version = VERSION, installed = false, sink = nil }
             local original
             local function intercept(target, ...)
-                local observer, ticket = rawget(bus, "sink"), nil
+                local observer = rawget(bus, "sink")
                 if not observer then return original(target, ...) end
                 local methodOK, method = pcall(getMethod)
                 if observer and methodOK and (method == "FireServer" or method == "InvokeServer") then
                     local callerOK, caller = pcall(checkCaller)
                     if callerOK and caller == false then
-                        local captured, value = pcall(observer.begin, target, method, ...)
-                        if captured then ticket = value end
+                        pcall(observer.begin, target, method, ...)
                     end
                 end
-                if not ticket or method ~= "InvokeServer" then return original(target, ...) end
-                -- Luau pcall is yieldable in a Lua closure; retain all nil results
-                -- and rethrow the exact original error object, without a new prefix.
-                local results = table.pack(pcall(original, target, ...))
-                pcall(observer.complete, ticket, results[1], table.unpack(results, 2, results.n))
-                if not results[1] then error(results[2], 0) end
-                return table.unpack(results, 2, results.n)
+                if methodOK and type(method) == "string" and type(setMethod) == "function" then pcall(setMethod, method) end
+                -- No result wrapper, post-call work, Instance methods or yields.
+                -- Preserve the original return values, error object and yielding.
+                return original(target, ...)
             end
-            local ok, previous = pcall(hook, gameObject, "__namecall", intercept)
-            if not ok then return false, "Could not install a yieldable Lua hook: " .. tostring(previous) end
+            local callback = intercept
+            if type(makeClosure) == "function" then
+                local ok, closure = pcall(makeClosure, intercept)
+                if ok and type(closure) == "function" then callback = closure end
+            end
+            local ok, previous = pcall(hook, gameObject, "__namecall", callback)
+            if not ok then return false, "Could not install a pass-through hook: " .. tostring(previous) end
             original = previous
             rawset(env, BUS_KEY, bus)
             if type(original) ~= "function" then return false, "Executor hook did not return the original namecall function." end
@@ -278,6 +369,7 @@ local function createGameplayRecorder(ctx)
         return true
     end
     function recorder:Stop()
+        self:Flush()
         generation += 1
         recording = false
         if attachedBus and rawget(attachedBus, "sink") == sink then rawset(attachedBus, "sink", nil) end
@@ -292,6 +384,7 @@ local function createGameplayRecorder(ctx)
     function recorder:Clear()
         generation += 1
         buffer, head, count = {}, 1, 0
+        queue, queueHead, queueCount, queueDropped = {}, 1, 0, 0
         dropped, total, outgoing, incoming, interactions, returns, errors = 0, 0, 0, 0, 0, 0, 0
     end
     function recorder:SetLabel(value)
@@ -301,6 +394,7 @@ local function createGameplayRecorder(ctx)
     end
     function recorder:Mark(value)
         if not recording or destroyed or not attachedBus or rawget(attachedBus, "sink") ~= sink then return false end
+        self:Flush()
         local encode = serializer()
         local detail = type(value) == "string" and value or label
         push({ kind = "marker", direction = "local", details = encode(detail, 0) })
@@ -308,6 +402,7 @@ local function createGameplayRecorder(ctx)
     end
     function recorder:Note(kind, details)
         if type(kind) ~= "string" or not recording or destroyed or not attachedBus or rawget(attachedBus, "sink") ~= sink then return false end
+        self:Flush()
         local encode = serializer()
         push({ kind = kind:gsub("[%c]", " "):sub(1, 64), direction = "local", details = encode(details, 0) })
         interactions += 1
@@ -335,6 +430,7 @@ local function createGameplayRecorder(ctx)
         return { recording = recording and attachedBus ~= nil and rawget(attachedBus, "sink") == sink,
             destroyed = destroyed, count = count, total = total, dropped = dropped, elapsed = safeTime(),
             outgoing = outgoing, incoming = incoming, interactions = interactions, returns = returns, errors = errors,
+            queued = queueCount, queueDropped = queueDropped, captureMode = "arguments-only",
             lastSequence = sequence, label = label, includeIncoming = includeIncoming, allReplicated = allReplicated, filter = filter }
     end
     return recorder
@@ -510,6 +606,8 @@ local function createRecorderDashboard(api)
     metrics.LayoutOrder, metrics.Size, metrics.AutomaticSize = 2, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
     local savedFile = label(capture, "Save log writes a .log file you can send here.", 10, C.muted)
     savedFile.LayoutOrder, savedFile.Size, savedFile.AutomaticSize = 3, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
+    local modeHint = label(capture, "Compatibility mode: outgoing arguments only. Inspection runs outside game calls.", 10, C.muted)
+    modeHint.LayoutOrder, modeHint.Size, modeHint.AutomaticSize = 4, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
     local optionSetters = {}
     local function option(text, method, key, order)
         local frame = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = order }, options)
@@ -728,6 +826,7 @@ local cachedContext, pending, pendingDropped = {}, {}, 0
 local preview, previewCursor = {}, 0
 local lastFlush, flushing, fileInitialized = 0, false, false
 local savedEvents, part = 0, 0
+local lastQueueDropped = 0
 local fileWrite = env.writefile or writefile
 local fileAppend = env.appendfile or appendfile
 local fileRead = env.readfile or readfile
@@ -801,7 +900,7 @@ end
 local function metadata()
     return { format = "karinderya-gameplay-recording", version = 1, sessionId = sessionId, placeId = game.PlaceId,
         playerUserId = player.UserId, capturedAtUTC = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        purpose = "manual gameplay observation; no remote replay" }
+        captureMode = "arguments-only", purpose = "manual gameplay observation; no remote replay" }
 end
 
 local function flush()
@@ -847,7 +946,7 @@ engine = createGameplayRecorder({ env = env, game = game, storage = Storage, clo
             if #pending < 1000 then table.insert(pending, event) else pendingDropped += 1 end
         end
     end })
-engine:SetIncludeIncoming(true)
+engine:SetIncludeIncoming(false)
 engine:SetLabel(label)
 
 function api:Start()
@@ -856,7 +955,7 @@ function api:Start()
     if ok then
         sampleContext()
         engine:Note("session-state", { action = "start", context = cachedContext })
-        message("Recording manual gameplay. Label each action before you perform it.")
+        message("Recording outgoing arguments in compatibility mode. Play normally, then Save Log.")
     else message("Recording unavailable: " .. tostring(reason)) end
     return ok
 end
@@ -876,6 +975,7 @@ function api:Mark(value)
     if value and value ~= "" then self:SetLabel(value) end
     if not active() then message("Start recording before adding a marker."); return false end
     sampleContext()
+    engine:Flush()
     engine:Mark(label)
     engine:Note("checkpoint", { context = cachedContext })
     message("Marked: " .. label .. ". Perform that action now.")
@@ -924,6 +1024,7 @@ function api:CopyEvent(sequence)
     return text
 end
 function api:Export()
+    engine:Flush()
     flush()
     local snapshot = { metadata = metadata(), stats = engine:Stats(), events = engine:Entries(),
         savedEvents = savedEvents, autosaveQueueDropped = pendingDropped, autosaveFile = fileInitialized and baseName .. ".log" or nil,
@@ -968,7 +1069,7 @@ function api:GetState()
         previewCursor = math.max(previewCursor, event.sequence)
     end
     return { recording = stats.recording, label = label, status = status, count = stats.count,
-        dropped = stats.dropped, elapsed = stats.elapsed, outgoing = stats.outgoing, incoming = stats.incoming,
+        dropped = stats.dropped + (stats.queueDropped or 0), elapsed = stats.elapsed, outgoing = stats.outgoing, incoming = stats.incoming,
         interactions = stats.interactions, returns = stats.returns, includeIncoming = stats.includeIncoming,
         allReplicated = stats.allReplicated, filter = stats.filter, autosave = autosave, lastExport = lastExport,
         events = table.clone(preview) }
@@ -1046,6 +1147,12 @@ dashboard = createRecorderDashboard(api)
 task.spawn(function()
     while alive do
         local ok, err = pcall(function()
+            engine:Flush(48)
+            local stats = engine:Stats()
+            if (stats.queueDropped or 0) > lastQueueDropped then
+                lastQueueDropped = stats.queueDropped
+                message("Capture queue was busy; " .. lastQueueDropped .. " calls were skipped. Narrow the path filter if needed.")
+            end
             if active() then sampleContext() end
             if autosave and os.clock() - lastFlush > 5 then flush() end
             if pendingDropped > 0 and active() then api:Stop(); message("Recording paused because autosave could not keep up. Export the retained data.") end
