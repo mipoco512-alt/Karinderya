@@ -1,12 +1,458 @@
--- Karinderya Gameplay Recorder v3.1 (automatic logging; lightweight Show Log File). Read RECORDER.md.
+-- Universal Roblox Runtime Inspector v1.0. Read INSPECTOR.md.
 
-local createGameplayRecorder = (function()
+local createInspectorJournal = (function()
+-- Bounded, local inspection journal. Record/State never touch the filesystem.
+-- Tick/Flush/Close save small batches; this module installs no hooks or network calls.
+local function createInspectorJournal(ctx)
+    local diagnostics = {}
+    local env = type(ctx.Env) == "table" and ctx.Env or {}
+    local writer = rawget(env, "writefile") or ctx.writefile or writefile
+    local appender = rawget(env, "appendfile") or ctx.appendfile or appendfile
+    local clock = ctx.now or os.clock
+    local enabled, notifications, autosave = ctx.enabled ~= false, ctx.notifications ~= false, ctx.autosave ~= false
+    local queue, history, recentFiles, taskStates, taskOrder = {}, {}, {}, {}, {}
+    local sequence, saved, dropped, filesCount, dropSummaries = 0, 0, 0, 0, 0
+    local pendingDrop, inFlight, inFlightDrop, busy, closed, closeRequested = nil, {}, nil, false, false, false
+    local errorMessage, failed, lastFile, lastAttemptedFile, lastSave, nextSave = nil, false, nil, nil, nil, 0
+    local counts = { total = 0, info = 0, warning = 0, error = 0, success = 0, debug = 0, transitions = 0 }
+    local fileIndex, fileBytes, fileRows, baseWritten = 0, 0, 0, false
+    local function finite(value) return type(value) == "number" and value == value and value > -math.huge and value < math.huge end
+    local function limit(value, fallback, minimum, maximum)
+        return finite(value) and math.clamp(math.floor(value), minimum, maximum) or fallback
+    end
+    local capacity = limit(ctx.maxPending, 128, 1, 128)
+    local lineLimit = limit(ctx.maxLineBytes, 32768, 1024, 32768)
+    local maxFileBytes = limit(ctx.maxFileBytes, 256 * 1024, lineLimit + 2048, 256 * 1024)
+    local maxFileEvents = limit(ctx.maxFileEvents, 512, 1, 512)
+    local function time()
+        local ok, value = pcall(clock)
+        return ok and finite(value) and math.max(0, value) or 0
+    end
+    local function sensitive(key)
+        local normalized = key:lower():gsub("[^%w]", "")
+        for _, word in ipairs({ "token", "secret", "password", "webhook", "cookie", "authorization", "apikey", "credential" }) do
+            if normalized:find(word, 1, true) then return true end
+        end
+        return normalized == "key" or normalized == "auth"
+    end
+    local function utf8Prefix(value, maximum)
+        local pieces, at, bytes = {}, 1, 0
+        while at <= #value and bytes < maximum do
+            local first = value:byte(at)
+            local width = first < 128 and 1 or first >= 194 and first <= 223 and 2
+                or first >= 224 and first <= 239 and 3 or first >= 240 and first <= 244 and 4 or 0
+            local valid = width > 0 and at + width - 1 <= #value
+            if valid and width > 1 then
+                for offset = 1, width - 1 do
+                    local byte = value:byte(at + offset)
+                    if byte < 128 or byte > 191 then valid = false; break end
+                end
+                local second = value:byte(at + 1)
+                if (first == 224 and second < 160) or (first == 237 and second > 159)
+                    or (first == 240 and second < 144) or (first == 244 and second > 143) then valid = false end
+            end
+            if not valid then table.insert(pieces, "?"); at += 1; bytes += 1
+            elseif bytes + width > maximum then break
+            else
+                local piece = value:sub(at, at + width - 1)
+                if width == 1 and first < 32 and first ~= 9 and first ~= 10 and first ~= 13 then piece = " " end
+                table.insert(pieces, piece); at += width; bytes += width
+            end
+        end
+        return table.concat(pieces)
+    end
+    local function redactText(value)
+        value = value:gsub("[Hh][Tt][Tt][Pp][Ss]?://%S+", "[URL removed]")
+        value = value:gsub("[Bb][Ee][Aa][Rr][Ee][Rr]%s+[%w%._%-]+", "Bearer [redacted]")
+        return (value:gsub("([%w_%-]+)(%s*[:=]%s*)([^%s,;]+)", function(key, separator, item)
+            return key .. separator .. (sensitive(key) and "[redacted]" or item)
+        end))
+    end
+    local function safeText(value, maximum)
+        if type(value) ~= "string" then
+            if finite(value) or type(value) == "boolean" then value = tostring(value) else return "[" .. type(value) .. "]" end
+        end
+        local originalSize = #value
+        value = utf8Prefix(value:sub(1, maximum * 4), maximum * 4)
+        value = redactText(value)
+        local clipped = utf8Prefix(value, maximum)
+        if #value > #clipped or originalSize > maximum * 4 then
+            local suffix = maximum >= 14 and " [truncated]" or "<cut>"
+            clipped = utf8Prefix(utf8Prefix(clipped, math.max(0, maximum - #suffix)) .. suffix, maximum)
+        end
+        return clipped
+    end
+    local function timestamp()
+        local ok, value
+        if type(ctx.utcNow) == "function" then ok, value = pcall(ctx.utcNow) end
+        if ok and type(value) == "string" then return safeText(value, 64) end
+        local formatted, result = pcall(os.date, "!%Y-%m-%dT%H:%M:%SZ", ok and finite(value) and value or os.time())
+        return formatted and result or "UTC unavailable"
+    end
+    local function serializedKey(value)
+        if type(value) == "string" then return value end
+        if type(value) ~= "table" or rawget(value, "type") ~= "string" then return nil end
+        local text = rawget(value, "value")
+        if type(text) ~= "string" then return nil end
+        if rawget(value, "encoding") ~= "hex" then return text end
+        if #text > 512 or #text % 2 ~= 0 or text:find("[^%x]") then return nil end
+        return (text:gsub("%x%x", function(pair) return string.char(tonumber(pair, 16)) end))
+    end
+    local function snapshot(value)
+        local remaining, strings, seen = 512, 12288, {}
+        local function visit(item, depth)
+            remaining -= 1
+            if remaining < 0 then return "[node limit]" end
+            local kind = type(item)
+            if kind == "nil" or kind == "boolean" then return item end
+            if kind == "number" then return finite(item) and item or "[non-finite number]" end
+            if kind == "string" then
+                local maximum = math.min(2048, strings)
+                if maximum <= 0 then return "[string limit]" end
+                local result = safeText(item, maximum); strings -= #result; return result
+            end
+            if kind ~= "table" then return "[" .. kind .. "]" end
+            if seen[item] then return "[circular]" end
+            if depth >= 12 then return "[depth limit]" end
+            seen[item] = true
+            -- Encoders represent invalid UTF-8 or long strings as hex. Inspect
+            -- that bounded byte payload for URLs/credentials before preserving
+            -- the encoding, otherwise an encoded URL could evade redaction.
+            local encodedString, hexValue, hexTruncated
+            if rawget(item, "type") == "string" and rawget(item, "encoding") == "hex" then
+                local hex = rawget(item, "value")
+                if type(hex) == "string" then
+                    local prefix = hex:sub(1, 8192)
+                    if #prefix % 2 == 0 and not prefix:find("[^%x]") then
+                        local decoded = prefix:gsub("%x%x", function(pair) return string.char(tonumber(pair, 16)) end)
+                        local redacted = redactText(decoded)
+                        if redacted ~= decoded then
+                            encodedString = redacted:gsub(".", function(byte) return string.format("%02x", byte:byte()) end)
+                        end
+                        hexValue, hexTruncated = encodedString or prefix, #hex > #prefix
+                    end
+                end
+            end
+            -- Inspect only a bounded prefix. Array indices remain numeric so the
+            -- recorder's args.values and typed table.entries stay JSON arrays.
+            local sampled, array, highest = {}, true, 0
+            local key, nested = next(item)
+            while key ~= nil and #sampled < 33 do
+                table.insert(sampled, { key, nested })
+                if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > 33 then array = false
+                else highest = math.max(highest, key) end
+                key, nested = next(item, key)
+            end
+            array = array and #sampled > 0 and highest == #sampled
+            local output = {}
+            if array then
+                local count = math.min(32, #sampled)
+                for index = 1, count do
+                    if remaining <= 0 then
+                        table.insert(output, { type = "truncated", reason = "node limit" }); break
+                    end
+                    output[index] = visit(rawget(item, index), depth + 1)
+                end
+                if #sampled > 32 and remaining > 0 then
+                    output[32] = { type = "truncated", reason = "entry limit", omittedFrom = 32 }
+                end
+            else
+                local keyName = serializedKey(rawget(item, "key"))
+                local serializedEntry = rawget(item, "key") ~= nil and rawget(item, "value") ~= nil
+                for index, pair in ipairs(sampled) do
+                    if index > 32 or remaining <= 0 then output.__truncated = true; break end
+                    local originalKey, value = pair[1], pair[2]
+                    local keyType = type(originalKey)
+                    local name = keyType == "string" and safeText(originalKey, 128)
+                        or keyType == "number" and finite(originalKey) and tostring(originalKey) or "unsupported_key_" .. index
+                    local redact = keyType == "string" and sensitive(originalKey)
+                    -- `key` is structural in the typed {key=...,value=...}
+                    -- format. Redact the associated value, not its field name.
+                    if serializedEntry and originalKey == "key" then redact = false end
+                    if serializedEntry and originalKey == "value" and keyName and sensitive(keyName) then redact = true end
+                    if hexValue and originalKey == "value" then
+                        local maximum = math.floor(math.min(4096, strings) / 2) * 2
+                        output[name] = hexValue:sub(1, maximum)
+                        strings -= #output[name]; remaining -= 1
+                        if #hexValue > maximum then hexTruncated = true end
+                    else
+                        output[name] = redact and "[redacted]" or visit(value, depth + 1)
+                    end
+                end
+                if encodedString then output.redacted = true end
+                if hexTruncated then output.truncated = true end
+            end
+            seen[item] = nil
+            return output
+        end
+        return visit(value, 0)
+    end
+    local function copy(value)
+        if type(value) ~= "table" then return value end
+        local result = {}; for key, item in pairs(value) do result[key] = copy(item) end; return result
+    end
+    local sessionId = type(ctx.sessionId) == "string" and ctx.sessionId or (tostring(os.time()) .. "-" .. tostring(math.floor(time() * 1000000)))
+    sessionId = sessionId:gsub("[^%w_%-]", ""):sub(1, 80)
+    if sessionId == "" then sessionId = "session-" .. tostring(os.time()) end
+    local stem = "universal-inspector-" .. sessionId
+    local baseFile, partsPattern = stem .. ".log", stem .. "-part*.log"
+    local mode = type(writer) ~= "function" and "memory" or type(appender) == "function" and "append" or "parts"
+    if mode == "memory" then errorMessage = "File logging unavailable: writefile is missing; diagnostics remain in memory." end
+    local createdAt = timestamp()
+    local function entry(level, action, message, details)
+        return { kind = "diagnostic", timestamp = timestamp(), elapsed = time(), level = level,
+            action = safeText(action or "inspection", 80), message = safeText(message or "", 1024),
+            details = details ~= nil and snapshot(details) or nil, sessionId = sessionId }
+    end
+    local function remember(value)
+        table.insert(history, value)
+        if #history > 40 then table.remove(history, 1) end
+    end
+    local function mergeDrops(older, newer)
+        if not older then return newer end
+        if not newer then return older end
+        return { count = older.count + newer.count, first = math.min(older.first, newer.first), last = math.max(older.last, newer.last) }
+    end
+    function diagnostics:Record(level, action, message, details)
+        if closed or not enabled then return nil end
+        level = type(level) == "string" and level:lower() or "info"
+        if level == "warn" then level = "warning" end
+        if counts[level] == nil or level == "total" or level == "transitions" then level = "info" end
+        sequence += 1
+        local value = entry(level, action, message, details); value.sequence = sequence
+        counts.total += 1; counts[level] += 1
+        if #queue + #inFlight >= capacity then
+            local evicted = table.remove(queue, 1)
+            if evicted then
+                dropped += 1
+                pendingDrop = mergeDrops(pendingDrop, { count = 1, first = evicted.sequence, last = evicted.sequence })
+            else
+                dropped += 1
+                pendingDrop = mergeDrops(pendingDrop, { count = 1, first = value.sequence, last = value.sequence })
+                remember(value); return copy(value)
+            end
+        end
+        table.insert(queue, value); remember(value)
+        return copy(value)
+    end
+    function diagnostics:ObserveTasks(taskMap, enabledMap)
+        if closed or not enabled or type(taskMap) ~= "table" then return end
+        local count = 0
+        for key, value in next, taskMap do
+            count += 1; if count > 128 then break end
+            if type(key) == "string" and #key <= 512 then
+                local action = safeText(key, 80)
+                local reason = type(value) == "table" and rawget(value, "status") or value
+                if type(reason) == "string" then
+                    reason = safeText(reason, 1024)
+                    local active
+                    if type(enabledMap) == "table" then active = rawget(enabledMap, key) end
+                    if type(active) ~= "boolean" then active = nil end
+                    local signature = tostring(active) .. "\0" .. reason
+                    local previous = taskStates[key]
+                    if not previous or previous.signature ~= signature then
+                        if not previous then
+                            table.insert(taskOrder, key)
+                            if #taskOrder > 128 then taskStates[table.remove(taskOrder, 1)] = nil end
+                        end
+                        taskStates[key] = { signature = signature, reason = reason }
+                        local lower = reason:lower()
+                        if active == true then
+                            local blocked = lower:find("needs recording", 1, true) or lower:find("blocked", 1, true)
+                                or lower:find("missing", 1, true) or lower:find("unavailable", 1, true) or lower:find("limit", 1, true)
+                                or lower:find("no supported", 1, true) or lower:find("data needed", 1, true) or lower:find("unmapped", 1, true)
+                            self:Record(blocked and "warning" or "info", "task:" .. action, reason,
+                                { enabled = active, status = reason, previous = previous and previous.reason or nil })
+                            counts.transitions += 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local function encode(value)
+        local ok, result = pcall(function()
+            if type(ctx.encode) == "function" then return ctx.encode(value) end
+            return ctx.HttpService:JSONEncode(value)
+        end)
+        if not ok or type(result) ~= "string" or result:find("[\r\n]") then return nil end
+        return result
+    end
+    local function line(value)
+        local result = encode(value)
+        if result and #result + 1 > lineLimit then
+            local compact = copy(value)
+            compact.details = { truncated = true, reason = "Encoded diagnostic exceeded the line limit" }
+            compact.message = safeText(compact.message, math.max(64, math.floor(lineLimit / 8)))
+            result = encode(compact)
+        end
+        if not result or #result + 1 > lineLimit then return nil end
+        return result .. "\n"
+    end
+    local function header(part)
+        return line({ kind = "session", format = "universal-inspector-journal-v1", sessionId = sessionId,
+            placeId = finite(ctx.placeId) and ctx.placeId or nil, version = safeText(ctx.version or "unknown", 80),
+            createdAtUTC = createdAt, mode = mode, part = part, partsPattern = partsPattern,
+            note = mode == "parts" and "Send this file and every matching numbered part; events are saved in immutable batches."
+                or "Automatic JSON-lines diagnostics; large sessions rotate into matching numbered parts." })
+    end
+    local function fail(message)
+        if not failed then
+            sequence += 1; counts.total += 1; counts.error += 1
+            local value = entry("error", "diagnostics.storage", message,
+                { pending = #queue + #inFlight, saved = saved, file = lastAttemptedFile })
+            value.kind, value.sequence = "storage-error", sequence
+            remember(value)
+        end
+        failed, errorMessage = true, message
+        return false, message
+    end
+    local function writeFile(name, payload, append)
+        lastAttemptedFile = name
+        local ok, result = pcall(append and appender or writer, name, payload)
+        if not ok or result == false then return fail("Diagnostic file write failed; automatic saving is paused to preserve earlier logs. Inspection can continue.") end
+        lastFile, lastSave = name, timestamp()
+        return true
+    end
+    local function rememberFile(name)
+        filesCount += 1; table.insert(recentFiles, name)
+        if #recentFiles > 8 then table.remove(recentFiles, 1) end
+    end
+    local function openFile()
+        fileIndex += 1
+        local name = fileIndex == 1 and baseFile or stem .. string.format("-part%06d.log", fileIndex)
+        local payload = header(fileIndex)
+        if not payload then return fail("Diagnostic header encoding failed; logs remain in memory.") end
+        if not writeFile(name, payload, false) then return false end
+        rememberFile(name); baseWritten = true; fileBytes, fileRows = #payload, 0
+        return true
+    end
+    local function persist(lines)
+        if not baseWritten and not openFile() then return false, 0 end
+        local at, committed = 1, 0
+        while at <= #lines do
+            local payloadHeader = mode == "parts" and header(fileIndex + 1) or ""
+            if payloadHeader == nil then fail("Diagnostic header encoding failed; logs remain in memory."); return false, committed end
+            local usedBytes, usedRows = mode == "parts" and #payloadHeader or fileBytes, mode == "parts" and 0 or fileRows
+            local payload, count = {}, 0
+            while at + count <= #lines and usedRows + count < maxFileEvents do
+                local item = lines[at + count]
+                if usedBytes + #item > maxFileBytes then break end
+                table.insert(payload, item); usedBytes += #item; count += 1
+            end
+            if count == 0 then
+                if mode == "parts" then fail("A diagnostic entry exceeds the file size limit; logs remain in memory."); return false, committed end
+                if not openFile() then return false, committed end
+            else
+                local name
+                if mode == "parts" then
+                    fileIndex += 1; name = stem .. string.format("-part%06d.log", fileIndex)
+                    if not writeFile(name, payloadHeader .. table.concat(payload), false) then return false, committed end
+                    rememberFile(name)
+                else
+                    name = fileIndex == 1 and baseFile or stem .. string.format("-part%06d.log", fileIndex)
+                    if not writeFile(name, table.concat(payload), true) then return false, committed end
+                    fileBytes, fileRows = usedBytes, usedRows + count
+                end
+                committed += count; at += count
+            end
+        end
+        return true, committed
+    end
+    function diagnostics:Flush(maxEntries)
+        if busy then if closeRequested then return false, "Final diagnostic save is already in progress" end; return false, "Diagnostic save in progress" end
+        if failed then return false, errorMessage end
+        if mode == "memory" then return fail(errorMessage) end
+        local budget = limit(maxEntries, 16, 1, 128)
+        if #queue == 0 and not pendingDrop then return true end
+        busy = true
+        local processed, success = 0, true
+        while (#queue > 0 or pendingDrop) and (processed < budget or closeRequested) do
+            inFlight, inFlightDrop = {}, pendingDrop; pendingDrop = nil
+            local batchSize = math.min(16, budget - processed, #queue)
+            if closeRequested then batchSize = math.min(16, #queue) end
+            for _ = 1, batchSize do table.insert(inFlight, table.remove(queue, 1)) end
+            local values = {}
+            if inFlightDrop then
+                local summary = entry("warning", "diagnostics.buffer", tostring(inFlightDrop.count) .. " diagnostic events dropped while waiting to save",
+                    { dropped = inFlightDrop.count, firstSequence = inFlightDrop.first, lastSequence = inFlightDrop.last, capacity = capacity })
+                summary.kind, summary.sequence = "drop-summary", inFlightDrop.last
+                table.insert(values, summary)
+            end
+            for _, value in ipairs(inFlight) do table.insert(values, value) end
+            local lines = {}
+            for _, value in ipairs(values) do
+                local encoded = line(value)
+                if not encoded then fail("Diagnostic entry encoding failed; saving is paused and logs remain in memory."); success = false; break end
+                table.insert(lines, encoded)
+            end
+            local committed = 0
+            if success then success, committed = persist(lines) end
+            local normalCommitted = committed
+            if inFlightDrop then
+                if committed > 0 then normalCommitted -= 1; dropSummaries += 1
+                else pendingDrop = mergeDrops(inFlightDrop, pendingDrop) end
+            end
+            saved += normalCommitted; processed += normalCommitted
+            for index = #inFlight, normalCommitted + 1, -1 do table.insert(queue, 1, inFlight[index]) end
+            inFlight, inFlightDrop = {}, nil
+            if not success then break end
+        end
+        busy = false
+        return success, success and nil or errorMessage
+    end
+    function diagnostics:Tick()
+        if closed or not autosave or failed or time() < nextSave then return end
+        nextSave = time() + 2
+        return self:Flush(16)
+    end
+    function diagnostics:Close()
+        closed, closeRequested = true, true
+        if busy then return false, "Final diagnostic save will finish with the current write" end
+        return self:Flush(128)
+    end
+    function diagnostics:SetEnabled(value)
+        if type(value) ~= "boolean" then return false end
+        if value and not enabled then taskStates, taskOrder = {}, {} end
+        enabled = value; return true
+    end
+    function diagnostics:SetNotifications(value)
+        if type(value) ~= "boolean" then return false end
+        notifications = value; return true
+    end
+    function diagnostics:ClearView() table.clear(history) end
+    function diagnostics:ShowFile()
+        if not lastFile and not lastAttemptedFile then return "No diagnostic log file has been written yet." end
+        local message = table.concat(recentFiles, "\n")
+        if message == "" then message = lastAttemptedFile end
+        if mode == "parts" or filesCount > 1 then message ..= "\nInclude " .. baseFile .. " and every file matching " .. partsPattern end
+        return message
+    end
+    function diagnostics:State()
+        local totals = copy(counts); totals.saved, totals.dropped, totals.dropSummaries = saved, dropped, dropSummaries
+        return { enabled = enabled, autosave = autosave and mode ~= "memory" and not failed, notifications = notifications,
+            mode = mode, baseFile = baseFile, partsPattern = partsPattern, files = table.clone(recentFiles), filesCount = filesCount,
+            lastFile = lastFile, saved = saved, pending = #queue + #inFlight, dropped = dropped, lastSave = lastSave,
+            error = errorMessage, failed = failed, events = copy(history), latest = history[#history] and copy(history[#history]) or nil,
+            counts = totals, closed = closed, saving = busy }
+    end
+    return diagnostics
+end
+
+return createInspectorJournal
+
+end)()
+
+local createInspectorCapture = (function()
 -- The hook only snapshots Lua arguments and forwards the original call directly.
 -- Instance methods, filtering, context and observers run later in Flush(). A
 -- nested Instance namecall must never replace the game's pending method name.
-local function createGameplayRecorder(ctx)
-    local BUS_KEY, VERSION = "__KarinderyaGameplayRecorderHook", "gameplay-recorder-v3"
-    local compatible = { [VERSION] = true, ["gameplay-recorder-v2"] = true, ["gameplay-recorder-v1"] = true }
+-- Start observes outbound calls; SetIncludeIncoming(true) permits an incoming-
+-- only fallback when hooking is unsupported. StartIncoming never installs a hook.
+-- Drive Tick from the caller's update loop for bounded discovery and delivery.
+-- Nothing starts automatically and no script source or return values are read.
+local function createInspectorCapture(ctx)
+    local BUS_KEY, VERSION = "__UniversalClientInspectorHook", "client-inspector-v1"
     -- Settings may reduce these ceilings; invalid/unbounded values use defaults.
     local ceilings = { records = 100, pending = 64, nodes = 128, strings = 4096, depth = 4, entries = 24, arguments = 32 }
     local limits = {}
@@ -18,14 +464,14 @@ local function createGameplayRecorder(ctx)
     local MAX_RECORDS, MAX_NODES, MAX_STRINGS = limits.records, limits.nodes, limits.strings
     local MAX_DEPTH, MAX_ENTRIES, MAX_ARGUMENTS = limits.depth, limits.entries, limits.arguments
     local MAX_PENDING = limits.pending
-    local env, gameObject, storage = ctx.env, ctx.game, ctx.storage
+    local env, gameObject = ctx.env or {}, ctx.game or game
     local clock = ctx.clock or os.clock
     local createdAt = clock()
     local buffer, head, count, sequence = {}, 1, 0, 0
     local dropped, total, outgoing, incoming, interactions, returns, errors = 0, 0, 0, 0, 0, 0, 0
     local recording, destroyed, generation = false, false, 0
     local queue, queueHead, queueCount, queueDropped, flushing = {}, 1, 0, 0, false
-    local includeIncoming, allReplicated, filter, label = false, false, "", ""
+    local includeIncoming, filter, label = false, "", ""
     local attachedBus, addedConnection, removedConnection
     local incomingConnections = {}
     local recorder, sink = {}, {}
@@ -224,36 +670,62 @@ local function createGameplayRecorder(ctx)
             count += 1
         end
         total += 1
-        if type(ctx.onRecord) == "function" then pcall(ctx.onRecord, copy(entry)) end
+        if type(ctx.onRecord) == "function" then local ok = pcall(ctx.onRecord, copy(entry)); if not ok then errors += 1 end end
         return entry.sequence
     end
+
+    -- The inspector sees this client's replicated hierarchy only. It never
+    -- replaces RemoteFunction.OnClientInvoke or reads/decompiles script source.
+    local MAX_CONNECTIONS, MAX_DISCOVERY, MAX_SCAN_DEPTH = 256, 512, 64
+    local incomingActive, incomingCount, incomingSkipped = false, 0, 0
+    local outgoingError, lastError = nil, nil
+    local discovery, discoveryHead, discoveryCount, discoveryDropped = {}, 1, 0, 0
+    local walk = {}
+    local origins = { game = 0, executor = 0, unknown = 0 }
+
+    local function failed(message)
+        errors += 1
+        lastError = message
+    end
+    local function capability(name)
+        if type(env) == "table" and type(rawget(env, name)) == "function" then return rawget(env, name) end
+        -- Resolve only known executor capabilities; never scan globals or GC.
+        if name == "hookmetamethod" then return hookmetamethod end
+        if name == "getnamecallmethod" then return getnamecallmethod end
+        if name == "checkcaller" then return checkcaller end
+        if name == "getcallingscript" then return getcallingscript end
+        if name == "setnamecallmethod" then return setnamecallmethod end
+        if name == "newcclosure" then return newcclosure end
+        return nil
+    end
+    local function outgoingActive()
+        return recording and attachedBus ~= nil and rawget(attachedBus, "sink") == sink
+    end
     local function matches(target, method)
-        if typeof(target) ~= "Instance" or not target:IsDescendantOf(storage) then return false end
+        if typeof(target) ~= "Instance" or not target:IsDescendantOf(gameObject) then return false end
         if method == "InvokeServer" then
             if not target:IsA("RemoteFunction") then return false end
         elseif not target:IsA("RemoteEvent") and not target:IsA("UnreliableRemoteEvent") then return false end
-        if not allReplicated then
-            local root = storage:FindFirstChild("Remotes")
-            if not root or not target:IsDescendantOf(root) then return false end
-        end
         return filter == "" or target:GetFullName():lower():find(filter, 1, true) ~= nil
     end
-    local function enqueue(target, method, direction, ...)
+    local function enqueue(target, method, direction, origin, callerScript, ...)
         if queueCount >= MAX_PENDING then queueDropped += 1; return end
         local args, deferred, budget = snapshotArguments(...)
         queue[(queueHead + queueCount - 1) % MAX_PENDING + 1] = {
-            target = target, method = method, direction = direction, args = args, deferred = deferred, budget = budget,
+            target = target, method = method, direction = direction, callerOrigin = origin,
+            caller = typeof(callerScript) == "Instance" and callerScript or nil,
+            args = args, deferred = deferred, budget = budget,
             generation = generation, label = label, time = safeTime(),
         }
         queueCount += 1
     end
-    function sink.begin(target, method, ...)
-        if not recording or destroyed or typeof(target) ~= "Instance"
-            or (method ~= "FireServer" and method ~= "InvokeServer") then return nil end
-        enqueue(target, method, "outgoing", ...)
-        -- Older resident hooks also tail original when this is nil. Never issue
-        -- response tickets: wrapping InvokeServer results changes its stack.
-        return nil
+    function sink.begin(target, method, origin, callerScript, ...)
+        if not outgoingActive() or destroyed or typeof(target) ~= "Instance"
+            or (method ~= "FireServer" and method ~= "InvokeServer") then return end
+        -- Zero Instance methods, property reads, filesystem work or observer
+        -- callbacks here. Both caller kinds use the same bounded snapshot.
+        local ok = pcall(enqueue, target, method, "outgoing", origin, callerScript, ...)
+        if not ok then failed("Argument snapshot failed; original call was forwarded.") end
     end
 
     function recorder:Flush(limit)
@@ -267,9 +739,7 @@ local function createGameplayRecorder(ctx)
             queueHead, queueCount = queueHead % MAX_PENDING + 1, queueCount - 1
             processed += 1
             if raw.generation == generation then
-                -- Metadata can disappear between the call and Flush. A failed
-                -- snapshot discards only this entry, never a game call.
-                pcall(function()
+                local ok = pcall(function()
                     if not matches(raw.target, raw.method) then return end
                     local encode = serializer(raw.budget)
                     local function materialize(value)
@@ -279,16 +749,22 @@ local function createGameplayRecorder(ctx)
                         for key, item in next, value do value[key] = materialize(item) end
                         return value
                     end
-                    local entry = { kind = "remote", direction = raw.direction, method = raw.method,
+                    local entry = {
+                        kind = "remote", direction = raw.direction, method = raw.method,
                         label = raw.label, time = raw.time, remote = encode(raw.target, 0),
-                        args = materialize(raw.args), status = raw.direction == "incoming" and "received" or "observed", metadataTiming = "deferred" }
-                    if type(ctx.context) == "function" then
-                        local ok, value = pcall(ctx.context)
-                        if ok and value ~= nil then entry.context = encode(value, 0) end
+                        callerOrigin = raw.callerOrigin,
+                        caller = raw.caller and encode(raw.caller, 0) or nil,
+                        args = materialize(raw.args), metadataTiming = "deferred",
+                        status = raw.direction == "incoming" and "received" or "observed",
+                    }
+                    if raw.direction == "incoming" then incoming += 1
+                    else
+                        outgoing += 1
+                        origins[raw.callerOrigin] = (origins[raw.callerOrigin] or 0) + 1
                     end
-                    if raw.direction == "incoming" then incoming += 1 else outgoing += 1 end
                     push(entry)
                 end)
+                if not ok then failed("Deferred remote metadata could not be serialized.") end
             end
         end
         flushing = false
@@ -296,48 +772,103 @@ local function createGameplayRecorder(ctx)
     end
 
     local function disconnectIncoming()
+        incomingActive = false
         if addedConnection then addedConnection:Disconnect(); addedConnection = nil end
         if removedConnection then removedConnection:Disconnect(); removedConnection = nil end
         for instance, connection in pairs(incomingConnections) do connection:Disconnect(); incomingConnections[instance] = nil end
+        incomingCount = 0
+        discovery, discoveryHead, discoveryCount, walk = {}, 1, 0, {}
+    end
+    local function queueDiscovery(instance)
+        if discoveryCount >= MAX_DISCOVERY then discoveryDropped += 1; return end
+        discovery[(discoveryHead + discoveryCount - 1) % MAX_DISCOVERY + 1] = instance
+        discoveryCount += 1
     end
     local function observeIncoming(instance)
-        if incomingConnections[instance] or not (instance:IsA("RemoteEvent") or instance:IsA("UnreliableRemoteEvent")) then return end
+        if incomingConnections[instance] or not instance:IsDescendantOf(gameObject)
+            or not (instance:IsA("RemoteEvent") or instance:IsA("UnreliableRemoteEvent")) then return end
+        if incomingCount >= MAX_CONNECTIONS then incomingSkipped += 1; return end
         incomingConnections[instance] = instance.OnClientEvent:Connect(function(...)
-            if not recording or not includeIncoming or not attachedBus or rawget(attachedBus, "sink") ~= sink then return end
-            -- Incoming callbacks share the same bounded queue and deferred work.
-            pcall(enqueue, instance, "OnClientEvent", "incoming", ...)
+            if not recording or destroyed or not incomingActive then return end
+            local ok = pcall(enqueue, instance, "OnClientEvent", "incoming", "server", nil, ...)
+            if not ok then failed("Incoming argument snapshot failed.") end
         end)
+        incomingCount += 1
     end
-    local function syncIncoming()
-        disconnectIncoming()
-        if not recording or not includeIncoming then return end
-        addedConnection = storage.DescendantAdded:Connect(observeIncoming)
-        removedConnection = storage.DescendantRemoving:Connect(function(instance)
-            local connection = incomingConnections[instance]
-            if connection then connection:Disconnect(); incomingConnections[instance] = nil end
+    local function beginIncoming()
+        if incomingActive then return true end
+        if typeof(gameObject) ~= "Instance" then return false, "Client game hierarchy is unavailable." end
+        local ok = pcall(function()
+            addedConnection = gameObject.DescendantAdded:Connect(queueDiscovery)
+            removedConnection = gameObject.DescendantRemoving:Connect(function(instance)
+                local connection = incomingConnections[instance]
+                if connection then
+                    connection:Disconnect(); incomingConnections[instance] = nil
+                    incomingCount -= 1
+                end
+            end)
         end)
-        for _, instance in ipairs(storage:GetDescendants()) do observeIncoming(instance) end
+        if not ok then disconnectIncoming(); return false, "Incoming discovery signals are unavailable." end
+        walk = { { node = gameObject, index = 1 } }
+        incomingActive = true
+        return true
+    end
+    local function scanOne()
+        if discoveryCount > 0 then
+            local instance = discovery[discoveryHead]
+            discovery[discoveryHead] = nil
+            discoveryHead, discoveryCount = discoveryHead % MAX_DISCOVERY + 1, discoveryCount - 1
+            observeIncoming(instance)
+            return true
+        end
+        local frame = walk[#walk]
+        if not frame then return false end
+        if not frame.children then
+            -- GetChildren is the only unavoidable bulk engine read. Its result
+            -- is traversed incrementally; no full GetDescendants scans occur.
+            local ok, children = pcall(function() return frame.node:GetChildren() end)
+            if not ok or type(children) ~= "table" then
+                table.remove(walk); failed("A hierarchy branch was inaccessible."); return true
+            end
+            frame.children = children
+        end
+        local child = frame.children[frame.index]
+        if not child then table.remove(walk); return true end
+        frame.index += 1
+        observeIncoming(child)
+        if #walk < MAX_SCAN_DEPTH then table.insert(walk, { node = child, index = 1 })
+        else discoveryDropped += 1 end
+        return true
+    end
+    function recorder:Tick(scanLimit, flushLimit)
+        if destroyed then return 0 end
+        local maximum = type(scanLimit) == "number" and scanLimit == scanLimit
+            and math.clamp(math.floor(scanLimit), 0, 256) or 80
+        if incomingActive then
+            for _ = 1, maximum do
+                local ok, more = pcall(scanOne)
+                if not ok then failed("Incoming discovery could not inspect an object.")
+                elseif not more then break end
+            end
+        end
+        return self:Flush(flushLimit == nil and 16 or flushLimit)
     end
 
-    function recorder:Start()
-        if destroyed then return false, "Recorder has been destroyed." end
-        if recording and attachedBus and rawget(attachedBus, "sink") == sink then return true end
+    local function startOutgoing()
+        if outgoingActive() then return true end
         if type(env) ~= "table" then return false, "A persistent executor environment is required." end
-        if typeof(storage) ~= "Instance" or not storage:IsA("ReplicatedStorage") then return false, "ReplicatedStorage is unavailable." end
+        if typeof(gameObject) ~= "Instance" then return false, "Client game hierarchy is unavailable." end
         local bus = rawget(env, BUS_KEY)
-        if bus ~= nil and (type(bus) ~= "table"
-            or not compatible[rawget(bus, "version")]
+        if bus ~= nil and (type(bus) ~= "table" or rawget(bus, "version") ~= VERSION
             or rawget(bus, "installed") ~= true) then
-            return false, "An incompatible gameplay recorder hook is already installed."
+            return false, "An incompatible or failed inspector hook already exists. Rejoin before retrying."
         end
         if bus == nil then
-            local hook = rawget(env, "hookmetamethod") or hookmetamethod
-            local getMethod = rawget(env, "getnamecallmethod") or getnamecallmethod
-            local checkCaller = rawget(env, "checkcaller") or checkcaller
-            local setMethod = rawget(env, "setnamecallmethod") or setnamecallmethod
-            local makeClosure = rawget(env, "newcclosure") or newcclosure
-            if type(hook) ~= "function" or type(getMethod) ~= "function" or type(checkCaller) ~= "function" then
-                return false, "Needs hookmetamethod, getnamecallmethod and checkcaller."
+            local hook, getMethod = capability("hookmetamethod"), capability("getnamecallmethod")
+            local checkCaller, callingScript = capability("checkcaller"), capability("getcallingscript")
+            local setMethod, makeClosure = capability("setnamecallmethod"), capability("newcclosure")
+            if type(hook) ~= "function" or type(getMethod) ~= "function" then
+                return false, "Outgoing observation needs hookmetamethod and getnamecallmethod."
             end
             bus = { version = VERSION, installed = false, sink = nil }
             local original
@@ -345,15 +876,21 @@ local function createGameplayRecorder(ctx)
                 local observer = rawget(bus, "sink")
                 if not observer then return original(target, ...) end
                 local methodOK, method = pcall(getMethod)
-                if observer and methodOK and (method == "FireServer" or method == "InvokeServer") then
-                    local callerOK, caller = pcall(checkCaller)
-                    if callerOK and caller == false then
-                        pcall(observer.begin, target, method, ...)
+                if methodOK and (method == "FireServer" or method == "InvokeServer") then
+                    local origin, callerScript = "unknown", nil
+                    if type(checkCaller) == "function" then
+                        local ok, value = pcall(checkCaller)
+                        if ok and type(value) == "boolean" then origin = value and "executor" or "game" end
                     end
+                    if type(callingScript) == "function" then
+                        local ok, value = pcall(callingScript)
+                        if ok and typeof(value) == "Instance" then callerScript = value end
+                    end
+                    pcall(observer.begin, target, method, origin, callerScript, ...)
                 end
                 if methodOK and type(method) == "string" and type(setMethod) == "function" then pcall(setMethod, method) end
-                -- No result wrapper, post-call work, Instance methods or yields.
-                -- Preserve the original return values, error object and yielding.
+                -- Tail-forward exactly once, preserving errors, return holes and
+                -- yields. No response interception, replay or callback changes.
                 return original(target, ...)
             end
             local callback = intercept
@@ -364,19 +901,39 @@ local function createGameplayRecorder(ctx)
                 callback = closure
             end
             local ok, previous = pcall(hook, gameObject, "__namecall", callback)
-            if not ok then return false, "Could not install a pass-through hook: " .. tostring(previous) end
+            if not ok then return false, "Executor could not install a pass-through observer." end
             original = previous
             rawset(env, BUS_KEY, bus)
-            if type(original) ~= "function" then return false, "Executor hook did not return the original namecall function." end
+            if type(original) ~= "function" then return false, "Executor did not return an original namecall function. Rejoin before retrying." end
             bus.installed = true
         end
         local previous = rawget(bus, "sink")
         if previous and previous ~= sink and type(previous.detach) == "function" then pcall(previous.detach) end
-        generation += 1
-        recording, attachedBus = true, bus
+        attachedBus = bus
         rawset(bus, "sink", sink)
-        syncIncoming()
         return true
+    end
+    function recorder:Start()
+        if destroyed then return false, "Inspector capture has been destroyed." end
+        local outgoingOK, reason = startOutgoing()
+        outgoingError = outgoingOK and nil or reason
+        local incomingOK, incomingReason = false, nil
+        if includeIncoming then incomingOK, incomingReason = beginIncoming() end
+        recording = outgoingOK or incomingOK
+        if recording then return true, not outgoingOK and ("Incoming only. " .. tostring(reason)) or nil end
+        return false, reason or incomingReason
+    end
+    function recorder:StartIncoming()
+        if destroyed then return false, "Inspector capture has been destroyed." end
+        includeIncoming = true
+        local ok, reason = beginIncoming()
+        if ok then recording = true end
+        return ok, reason
+    end
+    function recorder:StopIncoming()
+        includeIncoming = false
+        disconnectIncoming()
+        if not outgoingActive() then recording = false end
     end
     function recorder:Stop()
         self:Flush()
@@ -388,6 +945,7 @@ local function createGameplayRecorder(ctx)
     end
     sink.detach = function() recorder:Stop() end
     function recorder:Destroy()
+        if destroyed then return end
         self:Stop()
         destroyed = true
     end
@@ -396,6 +954,8 @@ local function createGameplayRecorder(ctx)
         buffer, head, count = {}, 1, 0
         queue, queueHead, queueCount, queueDropped = {}, 1, 0, 0
         dropped, total, outgoing, incoming, interactions, returns, errors = 0, 0, 0, 0, 0, 0, 0
+        origins = { game = 0, executor = 0, unknown = 0 }
+        lastError = nil
     end
     function recorder:SetLabel(value)
         if type(value) ~= "string" then return false end
@@ -403,26 +963,29 @@ local function createGameplayRecorder(ctx)
         return true
     end
     function recorder:Mark(value)
-        if not recording or destroyed or not attachedBus or rawget(attachedBus, "sink") ~= sink then return false end
+        if not recording or destroyed then return false end
         self:Flush()
         local encode = serializer()
-        local detail = type(value) == "string" and value or label
-        push({ kind = "marker", direction = "local", details = encode(detail, 0) })
+        push({ kind = "marker", direction = "local", details = encode(type(value) == "string" and value or label, 0) })
         return true
     end
     function recorder:Note(kind, details)
-        if type(kind) ~= "string" or not recording or destroyed or not attachedBus or rawget(attachedBus, "sink") ~= sink then return false end
+        if type(kind) ~= "string" or not recording or destroyed then return false end
         self:Flush()
         local encode = serializer()
-        push({ kind = kind:gsub("[%c]", " "):sub(1, 64), direction = "local", details = encode(details, 0) })
+        local ok = pcall(function()
+            push({ kind = kind:gsub("[%c]", " "):sub(1, 64), direction = "local", details = encode(details, 0) })
+        end)
+        if not ok then failed("Local note could not be serialized."); return false end
         interactions += 1
         return true
     end
     function recorder:SetIncludeIncoming(value)
         includeIncoming = value == true
-        syncIncoming()
+        if includeIncoming and recording then return beginIncoming() end
+        if not includeIncoming then self:StopIncoming() end
+        return true
     end
-    function recorder:SetAllReplicated(value) allReplicated = value == true end
     function recorder:SetFilter(value)
         if type(value) ~= "string" then return false end
         filter = value:lower():sub(1, 250)
@@ -437,458 +1000,1059 @@ local function createGameplayRecorder(ctx)
         return result
     end
     function recorder:Stats()
-        return { recording = recording and attachedBus ~= nil and rawget(attachedBus, "sink") == sink,
-            destroyed = destroyed, count = count, total = total, dropped = dropped, elapsed = safeTime(),
-            outgoing = outgoing, incoming = incoming, interactions = interactions, returns = returns, errors = errors,
-            queued = queueCount, queueDropped = queueDropped, captureMode = "arguments-only", limits = table.clone(limits),
-            lastSequence = sequence, label = label, includeIncoming = includeIncoming, allReplicated = allReplicated, filter = filter }
+        local resident = type(env) == "table" and rawget(env, BUS_KEY)
+        local hookSupported = (type(capability("hookmetamethod")) == "function" and type(capability("getnamecallmethod")) == "function")
+            or (type(resident) == "table" and rawget(resident, "installed") == true and rawget(resident, "version") == VERSION)
+        return {
+            recording = recording and (outgoingActive() or incomingActive), destroyed = destroyed,
+            outgoingActive = outgoingActive(), incomingActive = incomingActive, outgoingError = outgoingError,
+            count = count, total = total, dropped = dropped, elapsed = safeTime(),
+            outgoing = outgoing, incoming = incoming, origins = table.clone(origins), interactions = interactions,
+            returns = 0, errors = errors, lastError = lastError, queued = queueCount, queueDropped = queueDropped,
+            captureMode = "arguments-only", limits = table.clone(limits), lastSequence = sequence, label = label,
+            includeIncoming = includeIncoming, filter = filter,
+            incomingConnections = incomingCount, incomingConnectionLimit = MAX_CONNECTIONS, incomingSkipped = incomingSkipped,
+            discoveryPending = discoveryCount + #walk, discoveryDropped = discoveryDropped,
+            capabilities = { outgoing = hookSupported, incoming = typeof(gameObject) == "Instance",
+                callerOrigin = type(capability("checkcaller")) == "function", callerScript = type(capability("getcallingscript")) == "function" },
+            limitations = {
+                "Only this client's replicated and locally created objects are visible.",
+                "Outgoing capture covers namecall traffic; cached/direct function calls or later hook replacement may bypass it.",
+                "Caller attribution depends on executor capabilities and may be unknown.",
+                "InvokeServer results and incoming RemoteFunction callbacks are not intercepted.",
+                "Incoming discovery is incremental and limited to 256 event connections; early events can be missed.",
+                "This observer does not recover source code, downloaded scripts, or other players' injected code.",
+            },
+        }
     end
     return recorder
 end
 
-return createGameplayRecorder
+return createInspectorCapture
 
 end)()
 
-local createRecorderJournal = (function()
--- Durable local JSON-lines journal. Call Start before enabling the recorder and
--- Append only from its deferred onRecord callback, never inside a namecall hook.
-local function createRecorderJournal(ctx)
-    local journal = {}
-    local baseFile = tostring(ctx.baseName or "karinderya-gameplay") .. ".log"
-    local chunked = type(ctx.appendfile) ~= "function"
-    local initialized, failed, saved, lastFile, lastError = false, false, 0, nil, nil
-    local metadata = type(ctx.metadata) == "table" and ctx.metadata or {}
-    local sessionId = metadata.sessionId or metadata.session or ctx.baseName
-    local limit = tonumber(ctx.maxLineBytes) or 24 * 1024
-    if limit ~= limit or limit == math.huge or limit == -math.huge then limit = 24 * 1024 end
-    limit = math.max(1024, math.floor(limit))
+local createInspectorObjects = (function()
+-- Incremental, read-only inventory of the local data model. Source is read only
+-- after an explicit Inspect/Export action; an observed change has no creator ID.
+local function createInspectorObjects(ctx)
+    local api = {}
+    local root, options = ctx.game, ctx.options
+    local entries, byId, connections, watchers = {}, {}, {}, {}
+    local pending, head, visited, count, serial = {}, 1, {}, 0, 0
+    local changes, changeHead = {}, 1
+    local active, scanning, truncated, destroyed = false, false, false, false
+    local walked, dropped, watched, readErrors = 0, 0, 0, 0
+    local MAX_OBJECTS, MAX_WALK, MAX_PENDING, MAX_WATCH = 4000, 20000, 20000, 256
+    local MAX_CHANGES = 256
+    local kindLimits = { replicated = 1600, ui = 1000, script = 800, remote = 512, bindable = 88 }
+    local watchLimits = { replicated = 48, ui = 144, script = 64 }
+    local kindCounts, watchCounts = {}, {}
+    local evicted, watchSequence = 0, 0
+    local function prop(object, key)
+        local ok, value = pcall(function() return object[key] end)
+        if ok then return value end
+        return nil
+    end
+    local function isA(object, class)
+        local ok, value = pcall(function() return object:IsA(class) end)
+        return ok and value == true
+    end
+    local function path(object)
+        local ok, value = pcall(function() return object:GetFullName() end)
+        return ok and tostring(value):sub(1, 1000) or "[unavailable]"
+    end
+    local function under(object, ancestor)
+        if not ancestor then return false end
+        local ok, result = pcall(function() return object == ancestor or object:IsDescendantOf(ancestor) end)
+        return ok and result == true
+    end
+    local roots = { root }
+    for _, extra in ipairs(ctx.extraRoots or {}) do
+        if extra ~= root and not under(extra, root) then table.insert(roots, extra) end
+    end
+    local function accessible(object)
+        for _, scope in ipairs(roots) do if under(object, scope) then return true end end
+        return false
+    end
+    local function ignored(object)
+        local cursor = object
+        for _ = 1, 64 do
+            if not cursor then break end
+            if prop(cursor, "Name") == "UniversalInspectorDashboard" then return true end
+            cursor = prop(cursor, "Parent")
+        end
+        return false
+    end
+    local function classify(object)
+        if isA(object, "LuaSourceContainer") or isA(object, "Script") or isA(object, "LocalScript") or isA(object, "ModuleScript") then return "script" end
+        if isA(object, "RemoteEvent") or isA(object, "RemoteFunction") or isA(object, "UnreliableRemoteEvent") then return "remote" end
+        if isA(object, "ScreenGui") or isA(object, "GuiObject") or isA(object, "BillboardGui") or isA(object, "SurfaceGui") then return "ui" end
+        if under(object, ctx.storage) then return "replicated" end
+        if isA(object, "BindableEvent") or isA(object, "BindableFunction") then return "bindable" end
+        return nil
+    end
+    local function enabled(kind)
+        if kind == "script" then return options.scripts end
+        if kind == "ui" then return options.ui end
+        return options.replicated
+    end
+    local function emit(level, action, message, details)
+        if type(ctx.record) == "function" then ctx.record(level, action, message, details) end
+    end
+    local function enqueue(object, reason)
+        if #pending - head + 1 >= MAX_PENDING then truncated = true; dropped += 1; return end
+        table.insert(pending, { object = object, reason = reason })
+    end
+    local function change(object, action, field)
+        if not active or destroyed or ignored(object) then return end
+        if #changes - changeHead + 1 >= MAX_CHANGES then dropped += 1; return end
+        table.insert(changes, { object = object, action = action, field = field })
+    end
+    local function connect(signal, callback, bucket)
+        if not signal then return false end
+        local ok, connection = pcall(function() return signal:Connect(callback) end)
+        if ok then table.insert(bucket, connection); return true end
+        return false
+    end
+    local function unwatch(object)
+        local bucket = watchers[object]
+        if not bucket then return end
+        for _, connection in ipairs(bucket) do pcall(function() connection:Disconnect() end) end
+        watchers[object] = nil; watched -= 1
+        watchCounts[bucket.kind] = math.max(0, (watchCounts[bucket.kind] or 0) - 1)
+    end
+    local function watch(object, kind, priority)
+        if watchers[object] then return end
+        if kind ~= "ui" and kind ~= "replicated" and kind ~= "script" then return end
+        if (watchCounts[kind] or 0) >= watchLimits[kind] or watched >= MAX_WATCH then
+            if not priority then return end
+            local oldest, order
+            for candidate, bucket in pairs(watchers) do
+                if bucket.kind == kind and (not order or bucket.sequence < order) then oldest, order = candidate, bucket.sequence end
+            end
+            if not oldest then return end
+            unwatch(oldest)
+        end
+        watchSequence += 1
+        local bucket = { kind = kind, sequence = watchSequence }; watchers[object] = bucket; watched += 1
+        watchCounts[kind] = (watchCounts[kind] or 0) + 1
+        local fields = { "Name", "Parent" }
+        if kind == "ui" then
+            if isA(object, "GuiObject") then table.insert(fields, "Visible") else table.insert(fields, "Enabled") end
+            -- User-entered TextBox text is deliberately excluded from logging.
+            if isA(object, "TextLabel") or isA(object, "TextButton") then table.insert(fields, "Text") end
+        elseif kind == "script" and not isA(object, "ModuleScript") then table.insert(fields, "Enabled")
+        elseif isA(object, "ValueBase") then table.insert(fields, "Value") end
+        for _, field in ipairs(fields) do
+            local ok, signal = pcall(function() return object:GetPropertyChangedSignal(field) end)
+            if ok then connect(signal, function() change(object, "changed", field) end, bucket) end
+        end
+        if kind == "ui" and isA(object, "GuiButton") and options.interactions ~= false then
+            connect(prop(object, "Activated"), function() change(object, "activated") end, bucket)
+        end
+        connect(prop(object, "AttributeChanged"), function(name) change(object, "attribute", name) end, bucket)
+    end
+    local function describe(object, kind)
+        return { path = path(object), class = prop(object, "ClassName") or "Unknown", kind = kind,
+            sourceStatus = kind == "script" and "Not inspected; source may be inaccessible" or "Not a script" }
+    end
+    local function observe(object, reason)
+        if ignored(object) or not accessible(object) then return end
+        local kind = classify(object)
+        if not kind then return end
+        local row = entries[object]
+        if not row then
+            if count >= MAX_OBJECTS or (kindCounts[kind] or 0) >= kindLimits[kind] then
+                truncated = true
+                if reason ~= "added" then return end
+                local oldest, oldestId
+                for candidate, existing in pairs(entries) do
+                    local id = tonumber(existing.id)
+                    if existing.kind == kind and (not oldestId or id < oldestId) then oldest, oldestId = candidate, id end
+                end
+                if not oldest then return end
+                byId[entries[oldest].id], entries[oldest] = nil, nil
+                unwatch(oldest); count -= 1; kindCounts[kind] -= 1; evicted += 1
+            end
+            row = describe(object, kind); serial += 1; row.id = tostring(serial)
+            entries[object], byId[row.id], count = row, object, count + 1
+            kindCounts[kind] = (kindCounts[kind] or 0) + 1
+            if enabled(kind) then emit("info", kind .. "." .. reason, row.path,
+                { id = row.id, class = row.class, kind = kind, creator = "unknown", observation = reason }) end
+        else row.path = path(object) end
+        if active and enabled(kind) then watch(object, kind, reason == "added") end
+    end
+    local function remove(object)
+        local row = entries[object]
+        if row then
+            if enabled(row.kind) then emit("info", row.kind .. ".removed", row.path, { id = row.id, class = row.class }) end
+            byId[row.id], entries[object] = nil, nil; count -= 1
+            kindCounts[row.kind] = math.max(0, (kindCounts[row.kind] or 0) - 1)
+        end
+        visited[object] = nil; unwatch(object)
+    end
+    function api:Rescan()
+        pending, head, visited, walked, truncated = {}, 1, {}, 0, false
+        for object in pairs(entries) do if not accessible(object) then remove(object) end end
+        for _, scope in ipairs(roots) do enqueue(scope, "baseline") end
+        scanning = true
+        emit("info", "scan.start", "Scanning local objects in small batches", { objectLimit = MAX_OBJECTS, walkLimit = MAX_WALK })
+    end
+    function api:Start()
+        if destroyed then return false end
+        if active then return true end
+        active = true
+        for _, scope in ipairs(roots) do
+            connect(prop(scope, "DescendantAdded"), function(object) change(object, "added") end, connections)
+            connect(prop(scope, "DescendantRemoving"), function(object) change(object, "removed") end, connections)
+        end
+        for object, row in pairs(entries) do if enabled(row.kind) then watch(object, row.kind) end end
+        self:Rescan()
+        return true
+    end
+    function api:Stop()
+        active, scanning = false, false
+        for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+        table.clear(connections)
+        for object in pairs(watchers) do unwatch(object) end
+        -- Preserve the last queued changes when Stop follows an action before
+        -- the next scheduler tick. Bounded 16-event batches keep saves small.
+        while changeHead <= #changes do
+            self:Tick(1)
+            if type(ctx.flush) == "function" then ctx.flush() end
+        end
+        pending, changes, head, changeHead = {}, {}, 1, 1
+    end
+    function api:Reconfigure()
+        for object in pairs(watchers) do unwatch(object) end
+        if active then for object, row in pairs(entries) do if enabled(row.kind) then watch(object, row.kind) end end end
+    end
+    local function smallValue(value)
+        local kind = typeof(value)
+        if kind == "Instance" then return { class = prop(value, "ClassName"), path = path(value) } end
+        if kind == "string" then return value:sub(1, 512) end
+        if kind == "boolean" or kind == "number" or kind == "nil" then return value end
+        return "[" .. kind .. "]"
+    end
+    function api:Tick(limit)
+        if destroyed then return end
+        limit = math.clamp(tonumber(limit) or 60, 1, 100)
+        for _ = 1, math.min(16, #changes - changeHead + 1) do
+            local item = changes[changeHead]; changes[changeHead] = false; changeHead += 1
+            local object = item.object
+            if item.action == "removed" then remove(object)
+            elseif item.action == "added" then visited[object] = nil; observe(object, "added")
+            elseif item.action == "activated" then
+                local row = entries[object]
+                if row and options.ui and options.interactions ~= false then
+                    emit("info", "ui.activated", row.path, { id = row.id, class = row.class, creator = "unknown", observation = "local button Activated" })
+                end
+            else
+                local row = entries[object]
+                if row and enabled(row.kind) then
+                    local value
+                    if item.action == "attribute" then
+                        local ok, result = pcall(function() return object:GetAttribute(item.field) end)
+                        if ok then value = result end
+                    else value = prop(object, item.field) end
+                    row.path = path(object)
+                    emit("info", row.kind .. ".changed", row.path .. " / " .. tostring(item.field),
+                        { id = row.id, property = item.field, fields = { [tostring(item.field)] = smallValue(value) },
+                            metadataTiming = "deferred", creator = "unknown" })
+                end
+            end
+        end
+        if changeHead > #changes then changes, changeHead = {}, 1 end
+        if changeHead > 512 then
+            local remaining = {}
+            for index = changeHead, #changes do table.insert(remaining, changes[index]) end
+            changes, changeHead = remaining, 1
+        end
+        if not scanning then return end
+        for _ = 1, limit do
+            local taskItem = pending[head]
+            if not taskItem or walked >= MAX_WALK then break end
+            local object = taskItem.object
+            if not taskItem.children then
+                if visited[object] or ignored(object) then
+                    pending[head] = false; head += 1
+                    continue
+                end
+                visited[object] = true; walked += 1; observe(object, taskItem.reason)
+                local ok, children = pcall(function() return object:GetChildren() end)
+                taskItem.children = ok and children or {}
+                taskItem.childIndex = 1
+                if not ok then readErrors += 1 end
+            end
+            local child = taskItem.children[taskItem.childIndex]
+            if child then
+                enqueue(child, taskItem.reason)
+                taskItem.childIndex += 1
+            else
+                pending[head] = false; head += 1
+            end
+        end
+        if head > #pending or walked >= MAX_WALK then
+            truncated = truncated or walked >= MAX_WALK
+            pending, head, scanning = {}, 1, false
+            emit(truncated and "warning" or "info", "scan.complete", "Local inventory: " .. count .. " objects",
+                { walked = walked, limited = truncated, unreadableBranches = readErrors, watches = watched })
+        end
+    end
+    function api:State(filter)
+        local rows, matched = {}, 0
+        filter = type(filter) == "string" and filter:lower() or ""
+        for _, row in pairs(entries) do
+            if filter == "" or (row.path .. " " .. row.class .. " " .. row.kind):lower():find(filter, 1, true) then
+                matched += 1
+                if #rows < 200 then table.insert(rows, table.clone(row)) end
+            end
+        end
+        table.sort(rows, function(a, b) if a.kind == b.kind then return a.path < b.path end; return a.kind < b.kind end)
+        return { rows = rows, total = count, matched = matched, truncated = truncated or matched > #rows,
+            scanning = scanning, watched = watched, watchLimit = MAX_WATCH, dropped = dropped, unreadableBranches = readErrors,
+            kindCounts = table.clone(kindCounts), kindLimits = table.clone(kindLimits), watchCounts = table.clone(watchCounts),
+            watchLimits = table.clone(watchLimits), evicted = evicted }
+    end
+    local sourceTerms = { "FireServer", "InvokeServer", "OnClientEvent", "OnClientInvoke", "ReplicatedStorage",
+        "Instance.new", "ScreenGui", "loadstring", "require", "HttpGet", "request", "hookmetamethod", "getgenv", "string.char" }
+    local function readSource(object)
+        local ok, source = pcall(function() return object.Source end)
+        if not ok or type(source) ~= "string" then return nil, "Source inaccessible in this context" end
+        if source == "" then return nil, "Source empty or unavailable; no original code recovered" end
+        return source
+    end
+    function api:Inspect(id)
+        local object = byId[tostring(id)]
+        local row = object and entries[object]
+        if not row or not accessible(object) then return nil, "Object is no longer available; rescan" end
+        row.path = path(object)
+        local result = table.clone(row)
+        if active and enabled(row.kind) then watch(object, row.kind, true) end
+        result.summary = "Observed local " .. row.class .. ". Creator and purpose are unknown."
+        if row.kind == "script" then
+            local source, reason = readSource(object)
+            row.sourceStatus = source and "Readable Source property" or reason
+            result.sourceStatus = row.sourceStatus
+            if source then
+                local terms, fragment = {}, source:sub(1, 65536)
+                for _, term in ipairs(sourceTerms) do if fragment:find(term, 1, true) then table.insert(terms, term) end end
+                result.sourcePreview = fragment:sub(1, 2048)
+                result.sourceBytes = #source; result.references = terms
+                result.summary = tostring(#source) .. " source bytes. Text matches (not executed): " .. table.concat(terms, ", ")
+                    .. ". Readable source may still be obfuscated."
+            end
+        end
+        emit("info", "object.inspect", result.path, { id = result.id, sourceStatus = result.sourceStatus, summary = result.summary })
+        return result
+    end
+    function api:Source(id)
+        local object = byId[tostring(id)]
+        local row = object and entries[object]
+        if not row or row.kind ~= "script" or not accessible(object) then return nil, "Select an available script first" end
+        local source, reason = readSource(object)
+        if not source then return nil, reason end
+        if #source > 65536 then return nil, "Source exceeds the 64 KB export limit; automatic truncation would produce incomplete code" end
+        return source, row.path
+    end
+    function api:Destroy() self:Stop(); destroyed = true; entries, byId = {}, {} end
+    return api
+end
 
-    local function fail(reason)
-        failed, lastError = true, reason
-        return false, reason
-    end
-    local function encode(value)
-        local ok, result = pcall(ctx.encode, value)
-        if not ok or type(result) ~= "string" or result:find("[\r\n]") then return nil end
-        return result
-    end
-    local function boundedString(value, maximum)
-        if type(value) ~= "string" then return nil end
-        local result = value:sub(1, maximum)
-        -- Keep the compact JSON payload valid even when a UTF-8 character straddles
-        -- the size boundary. Captured recorder strings are already UTF-8-safe.
-        while #result > 0 and utf8.len(result) == nil do result = result:sub(1, -2) end
-        return result
+return createInspectorObjects
+
+end)()
+
+local createInspectorMotion = (function()
+-- Read-only local movement, tool and prompt observations. Distances and signals
+-- describe this client; they do not establish server acceptance or teleport use.
+local function createInspectorMotion(ctx)
+    local api = {}
+    local options = ctx.options or { movement = true, interactions = true }
+    local now = ctx.now or os.clock
+    local active, destroyed, initialStateSent = false, false, false
+    local character, root, humanoid, backpack
+    local connections, characterConnections, propertyConnections, promptConnections = {}, {}, {}, {}
+    local tools, toolCount = {}, 0
+    local queued, queueHead, queuedCount = {}, 1, 0
+    local MAX_QUEUE, MAX_TOOLS, MAX_EVENTS = 64, 8, 32
+    local counters = { samples = 0, summaries = 0, jumps = 0, propertyChanges = 0, toolEvents = 0, promptEvents = 0, dropped = 0, errors = 0 }
+    local status = "Paused"
+    local previous, lastSample, lastSummary, distanceSinceSummary, observedSpeed
+    local wasMoving = false
+    local eventWindow, eventCount, lastEvents = 0, 0, {}
+    local lastOptions = {}
+    local function prop(object, key)
+        local ok, value = pcall(function() return object[key] end)
+        if ok then return value end
+        return nil
     end
     local function finite(value)
         return type(value) == "number" and value == value and value > -math.huge and value < math.huge
     end
-    local function compact(event, small)
-        local remote = event.remote
-        if type(remote) == "table" then
-            remote = {
-                type = boundedString(remote.type, 24),
-                path = boundedString(remote.path, small and 32 or 256),
-                class = boundedString(remote.class, 48),
-            }
-        else
-            remote = boundedString(remote, small and 32 or 256)
-        end
-        return {
-            sequence = finite(event.sequence) and event.sequence or saved + 1,
-            time = finite(event.time) and event.time or nil,
-            kind = boundedString(event.kind, 32),
-            direction = boundedString(event.direction, 24),
-            label = boundedString(event.label, small and 16 or 96),
-            method = boundedString(event.method, 32),
-            remote = remote,
-            truncated = true, reason = "event too large",
-            args = { type = "truncated", truncated = true, reason = "event too large" },
+    local function vector(value)
+        local x, y, z = prop(value, "X"), prop(value, "Y"), prop(value, "Z")
+        if finite(x) and finite(y) and finite(z) then return { x = x, y = y, z = z } end
+        return nil
+    end
+    local function isA(object, class)
+        local ok, value = pcall(function() return object:IsA(class) end)
+        return ok and value == true
+    end
+    local function child(object, name, byClass)
+        local ok, value = pcall(function()
+            return byClass and object:FindFirstChildOfClass(name) or object:FindFirstChild(name)
+        end)
+        return ok and value or nil
+    end
+    local function children(object)
+        local ok, value = pcall(function() return object:GetChildren() end)
+        return ok and type(value) == "table" and value or {}
+    end
+    local function path(object)
+        local ok, value = pcall(function() return object:GetFullName() end)
+        return ok and type(value) == "string" and value:sub(1, 512) or "[unavailable]"
+    end
+    local function scalar(value)
+        if finite(value) or type(value) == "boolean" then return value end
+        if type(value) == "string" then return value:sub(1, 256) end
+        return nil
+    end
+    local function emit(level, action, message, details)
+        if type(ctx.record) ~= "function" then return end
+        local ok = pcall(ctx.record, level, action, message, details)
+        if not ok then counters.errors += 1 end
+    end
+    local function disconnect(bucket)
+        for _, connection in ipairs(bucket) do pcall(function() connection:Disconnect() end) end
+        table.clear(bucket)
+    end
+    local function connect(signal, callback, bucket)
+        if not signal then return end
+        local ok, connection = pcall(function() return signal:Connect(callback) end)
+        if ok then table.insert(bucket, connection) else counters.errors += 1 end
+    end
+    local function enqueue(action, object, detail, discriminator)
+        if not active or destroyed then return end
+        local time = now()
+        if time - eventWindow >= 1 or time < eventWindow then eventWindow, eventCount = time, 0 end
+        if eventCount >= MAX_EVENTS or queuedCount >= MAX_QUEUE then counters.dropped += 1; return end
+        local identity = discriminator or object
+        local recent = lastEvents[identity]
+        if recent and recent.action == action and time >= recent.time and time - recent.time < 0.1 then counters.dropped += 1; return end
+        -- Identities are only bounded tracked tools, properties, or one of three
+        -- prompt event categories. This cache cannot grow with world prompts.
+        lastEvents[identity] = { action = action, time = time }
+        eventCount += 1
+        queued[(queueHead + queuedCount - 1) % MAX_QUEUE + 1] = {
+            action = action, object = object, detail = detail, time = time,
         }
+        queuedCount += 1
     end
-    local function envelope(event)
-        return { kind = "event", sessionId = sessionId, event = event }
-    end
-
-    function journal:Start()
-        if failed then return false, lastError end
-        if initialized then return true end
-        if type(ctx.writefile) ~= "function" then return fail("File writing is unavailable; recording was not started.") end
-        if type(ctx.encode) ~= "function" then return fail("Log encoding is unavailable; recording was not started.") end
-        -- The caller supplies a new session base name. If readfile is available,
-        -- also refuse an accidental collision with an existing session log.
-        if type(ctx.readfile) == "function" then
-            local exists, contents = pcall(ctx.readfile, baseFile)
-            if exists and type(contents) == "string" then return fail("A session log already exists; choose a new session filename.") end
+    local function flush(limit)
+        for _ = 1, math.min(queuedCount, limit or 16) do
+            local item = queued[queueHead]
+            queued[queueHead] = nil
+            queueHead, queuedCount = queueHead % MAX_QUEUE + 1, queuedCount - 1
+            local details = item.detail or {}
+            details.path, details.observedAt, details.scope = path(item.object), item.time, "local client observation"
+            if item.action:sub(1, 5) == "tool." then counters.toolEvents += 1
+            elseif item.action:sub(1, 7) == "prompt." then counters.promptEvents += 1
+            elseif item.action == "movement.property" then counters.propertyChanges += 1 end
+            emit("info", item.action, item.action .. " / " .. details.path, details)
         end
-        local header = {
-            format = "karinderya-gameplay-journal-v1", kind = "session",
-            sessionId = sessionId, metadata = metadata, chunked = chunked,
-        }
-        if chunked then
-            header.partsPattern = tostring(ctx.baseName) .. "-event*.log"
-            header.note = "Each event is saved immediately in an immutable numbered part. Send this header and every matching event file."
-        else
-            header.note = "Events are appended immediately as JSON lines; no manual Save is required."
-        end
-        local payload = encode(header)
-        if not payload then return fail("Could not encode the session log header; recording was not started.") end
-        if #payload + 1 > limit then return fail("Session log metadata exceeds the line limit; recording was not started.") end
-        local ok, result = pcall(ctx.writefile, baseFile, payload .. "\n")
-        if not ok or result == false then return fail("Could not create the session log; recording was not started.") end
-        initialized, lastFile = true, baseFile
-        return true
     end
-
-    function journal:Append(event)
-        if failed then return false, lastError end
-        if not initialized then return false, "Start the session log before recording." end
-        if type(event) ~= "table" then return fail("Could not encode a recorded event; recording has been paused.") end
-        local payload = encode(envelope(event))
-        if not payload then return fail("Could not encode a recorded event; recording has been paused.") end
-        if #payload + 1 > limit then
-            payload = encode(envelope(compact(event, false)))
-            if payload and #payload + 1 > limit then payload = encode(envelope(compact(event, true))) end
-            if not payload or #payload + 1 > limit then
-                return fail("Could not encode a bounded recorded event; recording has been paused.")
+    local humanoidFields = { "WalkSpeed", "JumpPower", "JumpHeight", "HipHeight" }
+    local rootFields = { "Anchored", "CanCollide" }
+    local function resetSamples()
+        previous, lastSample, lastSummary, observedSpeed = nil, nil, nil, nil
+        distanceSinceSummary, wasMoving = 0, false
+    end
+    local function properties(object, fields, output)
+        for _, field in ipairs(fields) do output[field] = scalar(prop(object, field)) end
+    end
+    local function watchProperties(object, fields, source)
+        if not object then return end
+        for _, field in ipairs(fields) do
+            local ok, signal = pcall(function() return object:GetPropertyChangedSignal(field) end)
+            local previousValue = scalar(prop(object, field))
+            if ok then
+                connect(signal, function()
+                    if not options.movement then return end
+                    local value = scalar(prop(object, field))
+                    if value == previousValue then return end
+                    local old = previousValue; previousValue = value
+                    enqueue("movement.property", object, { property = field, previous = old, value = value }, source .. "." .. field)
+                end, propertyConnections)
             end
         end
-        local filename = chunked and (tostring(ctx.baseName) .. string.format("-event%06d.log", saved + 1)) or baseFile
-        -- A failed append may have written a partial line. Latch the error rather
-        -- than retrying and duplicating an event or overwriting a partial part.
-        local ok, result
-        if chunked then ok, result = pcall(ctx.writefile, filename, payload .. "\n")
-        else ok, result = pcall(ctx.appendfile, filename, payload .. "\n") end
-        if not ok or result == false then return fail("Could not save a recorded event; recording has been paused. Earlier saved logs remain on disk.") end
-        saved, lastFile = saved + 1, filename
+    end
+    local function forgetTools()
+        for tool, state in pairs(tools) do disconnect(state.connections); lastEvents[tool] = nil end
+        tools, toolCount = {}, 0
+    end
+    local function toolEvent(tool, action)
+        if not options.interactions then return end
+        local state = tools[tool]
+        if not state then return end
+        enqueue("tool." .. action, tool, { equipped = prop(tool, "Parent") == character })
+    end
+    local function syncTools()
+        if not options.interactions then forgetTools(); return end
+        backpack = child(ctx.Player, "Backpack")
+        for tool, state in pairs(tools) do
+            local parent = prop(tool, "Parent")
+            if parent ~= character and parent ~= backpack then
+                disconnect(state.connections); tools[tool], lastEvents[tool] = nil, nil; toolCount -= 1
+            end
+        end
+        for _, container in ipairs({ character or false, backpack or false }) do
+            -- A player's ordinary inventory is small. Cap inspected children as
+            -- well as subscribed tools so unusual inventories remain bounded.
+            for index, object in ipairs(children(container)) do
+                if index > 64 then break end
+                if toolCount >= MAX_TOOLS and container == character and not tools[object] and isA(object, "Tool") then
+                    -- The currently equipped tool takes priority over dormant
+                    -- backpack tools once the eight-tool budget has filled.
+                    for candidate, state in pairs(tools) do
+                        if prop(candidate, "Parent") ~= character then
+                            disconnect(state.connections); tools[candidate], lastEvents[candidate] = nil, nil
+                            toolCount -= 1
+                            break
+                        end
+                    end
+                end
+                if toolCount >= MAX_TOOLS then
+                    if container ~= character then break end
+                    continue
+                end
+                if not tools[object] and isA(object, "Tool") then
+                    local state = { connections = {} }; tools[object] = state; toolCount += 1
+                    for _, event in ipairs({ "Equipped", "Unequipped", "Activated", "Deactivated" }) do
+                        connect(prop(object, event), function() toolEvent(object, event:lower()) end, state.connections)
+                    end
+                    enqueue("tool.observed", object, { equipped = prop(object, "Parent") == character })
+                end
+            end
+        end
+    end
+    local function refreshCharacter()
+        local current = prop(ctx.Player, "Character")
+        if current ~= character then
+            disconnect(characterConnections); disconnect(propertyConnections); forgetTools()
+            character, root, humanoid = current, nil, nil
+            initialStateSent = false
+            resetSamples()
+            if current then
+                enqueue("character.observed", current, { position = vector(prop(child(current, "HumanoidRootPart"), "Position")) }, "character")
+                -- Discovery is sampled by Tick; no unbounded instance callbacks.
+            end
+        end
+        local nextRoot = character and child(character, "HumanoidRootPart") or nil
+        local nextHumanoid = character and child(character, "Humanoid", true) or nil
+        if nextRoot ~= root or nextHumanoid ~= humanoid then
+            disconnect(propertyConnections)
+            root, humanoid = nextRoot, nextHumanoid
+            resetSamples()
+            if options.movement then
+                watchProperties(humanoid, humanoidFields, "humanoid")
+                watchProperties(root, rootFields, "root")
+                if root and not initialStateSent then
+                    initialStateSent = true
+                    local detail = { position = vector(prop(root, "Position")), humanoid = {}, root = {} }
+                    properties(humanoid, humanoidFields, detail.humanoid)
+                    properties(root, rootFields, detail.root)
+                    enqueue("movement.initial", character, detail, "initial")
+                end
+            end
+        end
+        status = not character and "Waiting for local character"
+            or (not root and "Waiting for HumanoidRootPart" or "Observing local character")
+        syncTools()
+    end
+    local function syncPrompts()
+        disconnect(promptConnections)
+        if not active or not options.interactions or not ctx.ProximityPromptService then return end
+        for _, event in ipairs({ "PromptTriggered", "PromptButtonHoldBegan", "PromptButtonHoldEnded" }) do
+            connect(prop(ctx.ProximityPromptService, event), function(prompt, actingPlayer)
+                if actingPlayer ~= ctx.Player or not options.interactions then return end
+                enqueue("prompt." .. event, prompt, {
+                    action = scalar(prop(prompt, "ActionText")), object = scalar(prop(prompt, "ObjectText")),
+                    holdDuration = scalar(prop(prompt, "HoldDuration")), serverAccepted = "not observed",
+                }, event)
+            end, promptConnections)
+        end
+    end
+    function api:Start()
+        if destroyed then return false end
+        if active then return true end
+        active = true; lastOptions = { movement = options.movement, interactions = options.interactions }
+        connect(prop(ctx.Player, "CharacterAdded"), function() resetSamples() end, connections)
+        connect(prop(ctx.Player, "CharacterRemoving"), function()
+            resetSamples(); status = "Local character is being removed"
+        end, connections)
+        refreshCharacter(); syncPrompts()
         return true
     end
-
-    function journal:Stats()
-        return { initialized = initialized, failed = failed, saved = saved, lastFile = lastFile,
-            baseFile = baseFile, chunked = chunked, lastError = lastError }
+    function api:Stop()
+        if not active then return end
+        active = false
+        disconnect(connections); disconnect(characterConnections); disconnect(propertyConnections); disconnect(promptConnections)
+        forgetTools(); flush(MAX_QUEUE)
+        character, root, humanoid, backpack = nil, nil, nil, nil
+        resetSamples(); lastEvents = {}; status = "Paused"
     end
-
-    function journal:GetLog()
-        if not initialized then return nil, "No session log has been created." end
-        if chunked then return nil, "This session uses numbered event files; send the header and all matching parts." end
-        if type(ctx.readfile) ~= "function" then return nil, "Reading saved log files is unavailable in this executor." end
-        local ok, result = pcall(ctx.readfile, baseFile)
-        if not ok or type(result) ~= "string" then return nil, "Could not read the saved session log." end
-        return result
+    function api:Reconfigure()
+        if not active then return end
+        disconnect(propertyConnections)
+        if options.movement then watchProperties(humanoid, humanoidFields, "humanoid"); watchProperties(root, rootFields, "root") end
+        resetSamples(); syncTools(); syncPrompts()
+        lastOptions = { movement = options.movement, interactions = options.interactions }
     end
-
-    function journal:Close() end -- Every successful Append is already on disk.
-    return journal
+    function api:Tick()
+        if not active or destroyed then return end
+        if lastOptions.movement ~= options.movement or lastOptions.interactions ~= options.interactions then self:Reconfigure() end
+        refreshCharacter(); flush(16)
+        if not options.movement or not root then return end
+        local time = now()
+        if not finite(time) then counters.errors += 1; return end
+        if lastSample and time >= lastSample and time - lastSample < 0.25 then return end
+        local point = vector(prop(root, "Position"))
+        if not point then status = "Local root position is unavailable"; return end
+        counters.samples += 1
+        if previous and lastSample and time > lastSample then
+            local dx, dy, dz = point.x - previous.x, point.y - previous.y, point.z - previous.z
+            local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            local delta = time - lastSample
+            observedSpeed = distance / delta
+            distanceSinceSummary += distance
+            if distance >= 50 then
+                counters.jumps += 1
+                emit("info", "position.jump", "Large local position displacement observed", {
+                    from = previous, position = point, distance = distance, seconds = delta,
+                    observedSpeed = observedSpeed, meaning = "Observed displacement only; cause and server acceptance are unknown",
+                })
+            end
+            if lastSummary and time - lastSummary >= 1 then
+                local elapsed = time - lastSummary
+                local moving = distanceSinceSummary > 0.1
+                if moving or wasMoving then
+                    counters.summaries += 1
+                    emit("info", "movement.summary", moving and "Local movement observed" or "Local character stopped moving", {
+                        position = point, distance = distanceSinceSummary, seconds = elapsed,
+                        observedSpeed = observedSpeed, averageSpeed = distanceSinceSummary / elapsed,
+                        velocity = vector(prop(root, "AssemblyLinearVelocity")), moving = moving,
+                        walkSpeed = scalar(prop(humanoid, "WalkSpeed")), scope = "local client observation",
+                    })
+                end
+                lastSummary, distanceSinceSummary, wasMoving = time, 0, moving
+            end
+        else lastSummary, distanceSinceSummary, observedSpeed = time, 0, nil end
+        previous, lastSample = point, time
+    end
+    function api:State()
+        local connectionCount = #connections + #characterConnections + #propertyConnections + #promptConnections
+        for _, state in pairs(tools) do connectionCount += #state.connections end
+        local state = table.clone(counters)
+        state.active, state.destroyed, state.status = active, destroyed, status
+        state.character = character and path(character) or nil
+        state.trackedTools, state.toolLimit, state.connections = toolCount, MAX_TOOLS, connectionCount
+        state.promptConnections = #promptConnections
+        state.pending, state.lastSample, state.observedSpeed = queuedCount, lastSample, observedSpeed
+        state.position = previous and table.clone(previous) or nil
+        return state
+    end
+    function api:Destroy()
+        self:Stop(); destroyed = true
+    end
+    return api
 end
 
-return createRecorderJournal
+return createInspectorMotion
 
 end)()
 
-local createRecorderDashboard = (function()
--- Passive gameplay recorder UI. Runtime owns recording, export and all hooks.
-local function createRecorderDashboard(api)
+local createInspectorDashboard = (function()
+-- Client observation dashboard. The runtime owns capture, source access and disk I/O.
+local function createInspectorDashboard(api)
     local Players = game:GetService("Players")
     local Input = game:GetService("UserInputService")
     local Workspace = game:GetService("Workspace")
     local C = {
-        base = Color3.fromRGB(12, 19, 29), panel = Color3.fromRGB(20, 30, 43),
-        raised = Color3.fromRGB(29, 42, 57), line = Color3.fromRGB(45, 60, 76),
-        text = Color3.fromRGB(233, 242, 248), muted = Color3.fromRGB(150, 169, 188),
+        base = Color3.fromRGB(13, 20, 31), panel = Color3.fromRGB(20, 30, 43),
+        raised = Color3.fromRGB(28, 41, 55), line = Color3.fromRGB(42, 57, 71),
+        text = Color3.fromRGB(232, 241, 247), muted = Color3.fromRGB(148, 167, 184),
         teal = Color3.fromRGB(67, 218, 186), tealDark = Color3.fromRGB(23, 65, 61),
         amber = Color3.fromRGB(247, 193, 104), red = Color3.fromRGB(243, 132, 132),
     }
     local dashboard, state, alive = {}, {}, true
-    local connections, rows, cameraConnections = {}, {}, {}
-    local selectedSequence, detailText, collapsed, dragged = nil, "", false, false
-    local advanced = false
-    local connect, clearConnections, make, label, button
-    connect = function(signal, callback, bucket)
+    local connections, cameraConnections, pages, tabs, optionSetters = {}, {}, {}, {}, {}
+    local objectRows, eventRows = {}, {}
+    local collapsed, dragged, currentPage, eventFilter = false, false, "Activity", "All"
+    local selectedId
+    local function connect(signal, callback, bucket)
         local connection = signal:Connect(callback)
         connections[connection] = true
         if bucket then table.insert(bucket, connection) end
         return connection
     end
-    clearConnections = function(bucket)
+    local function disconnect(bucket)
         for _, connection in ipairs(bucket) do connection:Disconnect(); connections[connection] = nil end
         table.clear(bucket)
     end
-    make = function(class, props, parent)
-        local instance = Instance.new(class)
-        for key, value in pairs(props or {}) do instance[key] = value end
-        instance.Parent = parent
-        return instance
+    local function make(class, props, parent)
+        local object = Instance.new(class)
+        for key, value in pairs(props or {}) do object[key] = value end
+        object.Parent = parent
+        return object
     end
-    local function round(instance, radius)
-        make("UICorner", { CornerRadius = UDim.new(0, radius or 8) }, instance)
+    local function round(object, radius)
+        make("UICorner", { CornerRadius = UDim.new(0, radius or 8) }, object)
     end
-    local function outline(instance)
-        make("UIStroke", { Color = C.line, Transparency = 0.2, Thickness = 1 }, instance)
-    end
-    local function padding(instance, amount)
+    local function padding(object, amount)
         make("UIPadding", { PaddingTop = UDim.new(0, amount), PaddingBottom = UDim.new(0, amount),
-            PaddingLeft = UDim.new(0, amount), PaddingRight = UDim.new(0, amount) }, instance)
+            PaddingLeft = UDim.new(0, amount), PaddingRight = UDim.new(0, amount) }, object)
     end
-    local function stack(instance, gap)
-        return make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder,
-            Padding = UDim.new(0, gap or 8) }, instance)
+    local function stack(object, gap)
+        make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, gap or 8) }, object)
     end
-    label = function(parent, text, size, color)
-        return make("TextLabel", { BackgroundTransparency = 1, BorderSizePixel = 0,
-            Font = Enum.Font.Gotham, TextSize = size or 12, TextColor3 = color or C.text,
-            Text = text, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
-            Size = UDim2.new(1, 0, 0, 20) }, parent)
+    local function label(parent, text, color, name)
+        return make("TextLabel", { Name = name or "Label", BackgroundTransparency = 1, BorderSizePixel = 0,
+            Text = text, RichText = false, Font = Enum.Font.Gotham, TextSize = 12,
+            TextColor3 = color or C.text, TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y }, parent)
     end
-    button = function(parent, text, callback, primary, bucket)
-        local result = make("TextButton", { BackgroundColor3 = primary and C.teal or C.raised,
-            BorderSizePixel = 0, Font = Enum.Font.GothamMedium, TextSize = 11,
-            TextColor3 = primary and C.base or C.text, Text = text, AutoButtonColor = true,
-            Size = UDim2.fromOffset(100, 32) }, parent)
-        round(result, 7)
-        if callback then connect(result.Activated, callback, bucket) end
-        return result
+    local function button(parent, text, callback, primary, name, bucket)
+        local object = make("TextButton", { Name = name or "Button", BackgroundColor3 = primary and C.teal or C.raised,
+            BorderSizePixel = 0, Text = text, RichText = false, TextColor3 = primary and C.base or C.text,
+            Font = Enum.Font.GothamMedium, TextSize = 13, TextWrapped = true, AutoButtonColor = true,
+            Size = UDim2.new(1, 0, 0, 48) }, parent)
+        round(object)
+        if callback then connect(object.Activated, callback, bucket) end
+        return object
     end
-    local screen = make("ScreenGui", { Name = "KarinderyaRecorderDashboard", ResetOnSpawn = false,
-        IgnoreGuiInset = true, DisplayOrder = 102, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
+    local function input(parent, hint, name)
+        local object = make("TextBox", { Name = name, BackgroundColor3 = C.base, BorderSizePixel = 0,
+            Text = "", RichText = false, PlaceholderText = hint, PlaceholderColor3 = C.muted,
+            TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12,
+            ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left,
+            Size = UDim2.new(1, 0, 0, 48), TextTruncate = Enum.TextTruncate.AtEnd }, parent)
+        round(object, 6)
+        make("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9) }, object)
+        return object
+    end
+    -- Never render arbitrary data with tostring metamethods, or truncate through UTF-8.
+    local function text(value, limit)
+        if type(value) ~= "string" and type(value) ~= "number" and type(value) ~= "boolean" then return "" end
+        local result = tostring(value)
+        if utf8.len(result) == nil then return "[unreadable text]" end
+        if #result <= limit then return result end
+        local finish = limit
+        while finish > 0 and utf8.len(result:sub(1, finish)) == nil do finish -= 1 end
+        return result:sub(1, finish) .. "…"
+    end
+    local screen = make("ScreenGui", { Name = "UniversalInspectorDashboard", ResetOnSpawn = false,
+        IgnoreGuiInset = false, DisplayOrder = 103, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
     local parented = false
-    if type(gethui) == "function" then
-        parented = pcall(function() screen.Parent = gethui() end) and screen.Parent ~= nil
-    end
+    if type(gethui) == "function" then parented = pcall(function() screen.Parent = gethui() end) and screen.Parent ~= nil end
     if not parented then parented = pcall(function() screen.Parent = game:GetService("CoreGui") end) and screen.Parent ~= nil end
     if not parented then screen.Parent = Players.LocalPlayer:WaitForChild("PlayerGui") end
+    local safeArea = make("Frame", { Name = "SafeArea", BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1) }, screen)
     local window = make("Frame", { Name = "Window", BackgroundColor3 = C.base, BorderSizePixel = 0,
         AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.fromOffset(730, 620), ClipsDescendants = true }, screen)
+        Size = UDim2.fromOffset(740, 660), ClipsDescendants = true }, safeArea)
     round(window, 12)
-    outline(window)
-    local header = make("Frame", { Name = "Header", BackgroundColor3 = C.panel,
-        BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 62), Active = true }, window)
-    make("Frame", { BackgroundColor3 = C.teal, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 2) }, header)
-    local title = label(header, "KARINDERYA / GAMEPLAY RECORDER", 13)
-    title.Font = Enum.Font.GothamBold
-    title.Position, title.Size = UDim2.fromOffset(15, 12), UDim2.new(1, -100, 0, 20)
-    title.TextWrapped, title.TextTruncate = false, Enum.TextTruncate.AtEnd
-    local chip = label(header, "PAUSED", 9, C.amber)
-    chip.Font, chip.Position, chip.Size = Enum.Font.GothamBold, UDim2.fromOffset(16, 35), UDim2.fromOffset(78, 17)
-    local subtitle = label(header, "Capture one manual task at a time", 10, C.muted)
-    subtitle.Position, subtitle.Size = UDim2.fromOffset(96, 34), UDim2.new(1, -195, 0, 18)
-    subtitle.TextWrapped, subtitle.TextTruncate = false, Enum.TextTruncate.AtEnd
-    local collapseButton = button(header, "-", function() collapsed = not collapsed; dashboard:Resize() end)
-    collapseButton.Position, collapseButton.Size = UDim2.new(1, -76, 0, 17), UDim2.fromOffset(26, 28)
-    local footer = make("Frame", { BackgroundColor3 = C.panel, BorderSizePixel = 0,
+    make("UIStroke", { Color = C.line, Thickness = 1 }, window)
+    local header = make("Frame", { Name = "Header", BackgroundColor3 = C.panel, BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 62), Active = true }, window)
+    local title = label(header, "ROBLOX / INSPECTOR", C.text, "Title")
+    title.Font, title.TextSize = Enum.Font.GothamBold, 14
+    title.AutomaticSize, title.TextWrapped = Enum.AutomaticSize.None, false
+    title.Position, title.Size = UDim2.fromOffset(12, 11), UDim2.new(1, -128, 0, 20)
+    title.TextTruncate = Enum.TextTruncate.AtEnd
+    local phase = label(header, "PAUSED · CLIENT OBSERVATIONS", C.muted, "Phase")
+    phase.AutomaticSize, phase.TextWrapped = Enum.AutomaticSize.None, false
+    phase.Position, phase.Size = UDim2.fromOffset(12, 35), UDim2.new(1, -128, 0, 18)
+    phase.TextSize, phase.TextTruncate = 10, Enum.TextTruncate.AtEnd
+    local footer = make("Frame", { Name = "Footer", BackgroundColor3 = C.panel, BorderSizePixel = 0,
         Position = UDim2.new(0, 0, 1, -30), Size = UDim2.new(1, 0, 0, 30) }, window)
-    local status = label(footer, "Ready. Name a task, then start recording.", 10, C.muted)
-    status.Position, status.Size = UDim2.fromOffset(12, 0), UDim2.new(1, -190, 1, 0)
-    status.TextWrapped, status.TextTruncate = false, Enum.TextTruncate.AtEnd
-    local hotkeys = label(footer, "F7 Record  F8 Hide  F9 Mark", 9, C.muted)
-    hotkeys.Position, hotkeys.Size = UDim2.new(1, -177, 0, 0), UDim2.fromOffset(165, 30)
-    hotkeys.TextXAlignment = Enum.TextXAlignment.Right
+    local status = label(footer, "Ready", C.muted, "Status")
+    status.AutomaticSize, status.TextWrapped = Enum.AutomaticSize.None, false
+    status.Position, status.Size = UDim2.fromOffset(12, 7), UDim2.new(1, -24, 0, 18)
+    status.TextTruncate = Enum.TextTruncate.AtEnd
+    local fileBox, fileFeedback
     local function invoke(method, ...)
         if not alive then return nil end
-        if type(api[method]) ~= "function" then status.Text = "Unavailable action: " .. method; return nil end
+        if type(api[method]) ~= "function" then status.Text = "Unavailable: " .. method; return nil end
         local ok, result = pcall(api[method], api, ...)
-        if not ok then status.Text = tostring(result); return nil end
-        if method == "SaveLog" or method == "Export" then
-            status.Text = type(result) == "string" and ("Log file: " .. result) or "No local log file is available."
-            return result -- Do not copy live event tables or rebuild rows for this button.
+        if not ok then status.Text = "Action failed: " .. text(result, 350); return nil end
+        -- Filename display must remain independent of source/event snapshots.
+        if method == "ShowFiles" then
+            if fileFeedback then fileFeedback.Text = type(result) == "string" and text(result, 2048) or "No local file is available." end
+            status.Text = "File information shown in Tools. Select the filename to copy it."
+            return result
+        end
+        if method == "Save" or method == "ExportSource" then
+            if fileFeedback then fileFeedback.Text = type(result) == "string" and text(result, 2048) or "See the save status below." end
         end
         if alive and method ~= "Destroy" then
-            local gotState, snapshot = pcall(api.GetState, api)
-            if gotState and type(snapshot) == "table" then dashboard:Refresh(snapshot) end
+            local got, snapshot = pcall(api.GetState, api)
+            if got and type(snapshot) == "table" then dashboard:Refresh(snapshot) end
         end
         return result
     end
-    local close = button(header, "x", function() invoke("Destroy") end)
-    close.Position, close.Size, close.TextColor3 = UDim2.new(1, -42, 0, 17), UDim2.fromOffset(26, 28), C.red
-    local content = make("ScrollingFrame", { Name = "Content", BackgroundTransparency = 1,
-        BorderSizePixel = 0, Position = UDim2.fromOffset(0, 62), Size = UDim2.new(1, 0, 1, -92),
-        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 4,
-        ScrollBarImageColor3 = C.line }, window)
-    padding(content, 12)
-    stack(content, 10)
-    local function card(heading, order)
-        local result = make("Frame", { BackgroundColor3 = C.panel, BorderSizePixel = 0,
-            Size = UDim2.new(1, -4, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order }, content)
-        round(result, 9)
-        padding(result, 12)
-        stack(result, 8)
-        local text = label(result, heading, 11)
-        text.Font, text.LayoutOrder = Enum.Font.GothamBold, 0
-        return result
+    local minimize = button(header, "−", function() dashboard:Toggle() end, false, "Minimize")
+    minimize.Position, minimize.Size = UDim2.new(1, -108, 0, 7), UDim2.fromOffset(48, 48)
+    local close = button(header, "×", function() invoke("Destroy") end, false, "Unload")
+    close.Position, close.Size, close.TextColor3 = UDim2.new(1, -54, 0, 7), UDim2.fromOffset(48, 48), C.red
+    local launcher = make("Frame", { Name = "InspectorLauncher", BackgroundColor3 = C.base, BorderSizePixel = 0,
+        Visible = false, Size = UDim2.fromOffset(228, 48), Position = UDim2.new(1, -240, 0, 12) }, safeArea)
+    round(launcher)
+    local reopen = button(launcher, "OPEN INSPECTOR", function() dashboard:Toggle() end, false, "OpenInspector")
+    reopen.Size = UDim2.fromOffset(148, 48)
+    local quick = button(launcher, "START", function() invoke(state.running and "Stop" or "Start") end, true, "QuickStartStop")
+    quick.Position, quick.Size = UDim2.fromOffset(156, 0), UDim2.fromOffset(72, 48)
+    local controls = make("Frame", { Name = "Controls", BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(10, 70), Size = UDim2.new(1, -20, 0, 48) }, window)
+    local run = button(controls, "START OBSERVING", function() invoke(state.running and "Stop" or "Start") end, true, "StartStop")
+    run.Size = UDim2.new(0.6, -4, 1, 0)
+    local rescan = button(controls, "RESCAN", function() invoke("Rescan") end, false, "Rescan")
+    rescan.Position, rescan.Size = UDim2.new(0.6, 4, 0, 0), UDim2.new(0.4, -4, 1, 0)
+    local tabFrame = make("Frame", { Name = "Tabs", BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(10, 126), Size = UDim2.new(1, -20, 0, 48) }, window)
+    local content = make("Frame", { Name = "Content", BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(0, 182), Size = UDim2.new(1, 0, 1, -212) }, window)
+    local function selectPage(name)
+        currentPage = name
+        for pageName, page in pairs(pages) do page.Visible = pageName == name end
+        for pageName, tab in pairs(tabs) do
+            tab.BackgroundColor3 = pageName == name and C.tealDark or C.raised
+            tab.TextColor3 = pageName == name and C.teal or C.muted
+        end
     end
-    local function input(parent, hint)
-        local result = make("TextBox", { BackgroundColor3 = C.base, BorderSizePixel = 0,
-            Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = C.text,
-            TextXAlignment = Enum.TextXAlignment.Left, Text = "", ClearTextOnFocus = false,
-            PlaceholderText = hint, PlaceholderColor3 = C.muted, Size = UDim2.new(1, 0, 0, 32),
-            TextTruncate = Enum.TextTruncate.AtEnd }, parent)
-        round(result, 6)
-        outline(result)
-        make("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9) }, result)
-        return result
+    for index, name in ipairs({ "Activity", "Objects", "Tools" }) do
+        local tab = button(tabFrame, name, function() selectPage(name) end, false, "Tab" .. name)
+        tab.Position, tab.Size = UDim2.new((index - 1) / 3, index == 1 and 0 or 3, 0, 0), UDim2.new(1 / 3, -4, 1, 0)
+        tabs[name] = tab
+        local page = make("ScrollingFrame", { Name = name, BackgroundTransparency = 1, BorderSizePixel = 0,
+            Size = UDim2.fromScale(1, 1), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 4, ScrollBarImageColor3 = C.line,
+            Visible = name == currentPage }, content)
+        padding(page, 10); stack(page, 10); pages[name] = page
     end
-    local capture = card("CAPTURE A GAMEPLAY TASK", 1)
-    local controls = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 1 }, capture)
-    local run = button(controls, "START RECORDING", function() invoke(state.recording and "Stop" or "Start") end, true)
-    run.Size = UDim2.new(0.46, -4, 1, 0)
-    local export = button(controls, "SHOW LOG FILE", function() invoke(type(api.SaveLog) == "function" and "SaveLog" or "Export") end)
-    export.Position, export.Size = UDim2.new(0.46, 4, 0, 0), UDim2.new(0.34, -8, 1, 0)
-    local options = card("RECORDING OPTIONS", 2)
-    options.Visible = false
-    local optionsButton = button(controls, "OPTIONS", function()
-        advanced = not advanced
-        options.Visible = advanced
-    end)
-    optionsButton.Position, optionsButton.Size = UDim2.new(0.8, 4, 0, 0), UDim2.new(0.2, -4, 1, 0)
-    local labelRow = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 32), LayoutOrder = 1 }, options)
-    local taskLabel = input(labelRow, "Task label, e.g. buy rice or serve a customer")
-    taskLabel.Size = UDim2.new(1, -172, 1, 0)
-    local apply = button(labelRow, "APPLY", function() invoke("SetLabel", taskLabel.Text) end)
-    apply.Position, apply.Size = UDim2.new(1, -164, 0, 0), UDim2.fromOffset(72, 32)
-    local mark = button(labelRow, "+ MARK", function() invoke("Mark", taskLabel.Text) end)
-    mark.Position, mark.Size = UDim2.new(1, -84, 0, 0), UDim2.fromOffset(84, 32)
-    connect(taskLabel.FocusLost, function(enter) if enter then invoke("SetLabel", taskLabel.Text) end end)
-    local hint = label(options, "Label each step before doing it: accept customer → cook → serve → clean. Marks separate actions in the log.", 10, C.muted)
-    hint.LayoutOrder, hint.Size, hint.AutomaticSize = 2, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
-    local metrics = label(capture, "0 events  /  0 outgoing  /  0 incoming  /  0 interactions", 10, C.teal)
-    metrics.LayoutOrder, metrics.Size, metrics.AutomaticSize = 2, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
-    local savedFile = label(capture, "Save log writes a .log file you can send here.", 10, C.muted)
-    savedFile.LayoutOrder, savedFile.Size, savedFile.AutomaticSize = 3, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
-    local modeHint = label(capture, "Recovery mode: log created before recording; captured calls save automatically.", 10, C.muted)
-    modeHint.LayoutOrder, modeHint.Size, modeHint.AutomaticSize = 4, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
-    local optionSetters = {}
-    local function option(text, method, key, order)
-        local frame = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = order }, options)
-        local caption = label(frame, text, 11, C.muted)
-        caption.Size = UDim2.new(1, -54, 1, 0)
+    local function card(page, heading, order)
+        local object = make("Frame", { Name = heading, BackgroundColor3 = C.panel, BorderSizePixel = 0,
+            Size = UDim2.new(1, -4, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = order }, pages[page])
+        round(object); padding(object, 10); stack(object, 8)
+        local caption = label(object, heading, C.text)
+        caption.Font, caption.LayoutOrder = Enum.Font.GothamBold, 0
+        return object
+    end
+    local intro = card("Activity", "CLIENT OBSERVATIONS", 1)
+    local scope = label(intro, "Observed changes do not identify who created them. A remote definition is an available endpoint; a captured call is an observed invocation. Can start after another script; earlier calls cannot be recovered.", C.amber, "ObservationLimits")
+    scope.LayoutOrder = 1
+    local metrics = label(intro, "Waiting for observations.", C.teal, "CaptureMetrics")
+    metrics.LayoutOrder = 2
+    local activity = card("Activity", "RECENT EVENTS", 2)
+    local filterButton
+    filterButton = button(activity, "EVENTS: ALL", function()
+        eventFilter = eventFilter == "All" and "Warnings" or (eventFilter == "Warnings" and "Errors" or "All")
+        dashboard:Refresh(state)
+    end, false, "EventFilter")
+    filterButton.LayoutOrder = 1
+    local eventList = make("Frame", { Name = "Events", BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2 }, activity)
+    stack(eventList, 6)
+    local eventEmpty = label(eventList, "No matching events in the live window.", C.muted, "EventEmpty")
+    local objects = card("Objects", "LOADED OBJECTS", 1)
+    label(objects, "Search the loaded client objects. Selecting a row inspects metadata; source export requires a separate button.", C.muted).LayoutOrder = 1
+    local search = input(objects, "Search path, name or class", "ObjectSearch")
+    search.LayoutOrder = 2
+    connect(search.FocusLost, function() invoke("SetFilter", search.Text) end)
+    local applySearch = button(objects, "APPLY SEARCH", function() invoke("SetFilter", search.Text) end, false, "ApplySearch")
+    applySearch.LayoutOrder = 3
+    local objectCount = label(objects, "No loaded objects.", C.muted, "ObjectCount")
+    objectCount.LayoutOrder = 4
+    local objectList = make("Frame", { Name = "ObjectList", BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 5 }, objects)
+    stack(objectList, 6)
+    local selection = card("Objects", "SELECTED OBJECT", 2)
+    local selectedText = label(selection, "Select an object above.", C.muted, "SelectedObject")
+    selectedText.LayoutOrder = 1
+    local inspect = button(selection, "REFRESH INSPECTION", function()
+        if selectedId then invoke("InspectSelected", selectedId) else status.Text = "Select an object first." end
+    end, false, "InspectSelected")
+    inspect.LayoutOrder = 2
+    local exportSource = button(selection, "EXPORT READABLE SOURCE", function()
+        if selectedId then invoke("ExportSource", selectedId) else status.Text = "Select a readable script first." end
+    end, false, "ExportSource")
+    exportSource.LayoutOrder = 3
+    local preview = input(selection, "Readable source preview appears here", "SourcePreview")
+    preview.LayoutOrder, preview.TextEditable, preview.MultiLine = 4, false, true
+    preview.TextTruncate, preview.TextWrapped = Enum.TextTruncate.None, true
+    preview.TextYAlignment, preview.Font = Enum.TextYAlignment.Top, Enum.Font.Code
+    preview.Size, preview.AutomaticSize = UDim2.new(1, 0, 0, 48), Enum.AutomaticSize.Y
+    label(selection, "Only the selected script's accessible Source can be exported. Unreadable source, server-only source inaccessible to this client, and other players' executor code cannot be recovered here. No decompilation is performed.", C.muted).LayoutOrder = 5
+    local options = card("Tools", "CAPTURE OPTIONS", 1)
+    for index, definition in ipairs({
+        { "outgoing", "Outgoing remote calls", "Executor support required; enable explicitly." },
+        { "incoming", "Incoming remote events", "Observe events delivered to this client." },
+        { "ui", "UI changes", "Observe loaded UI objects and changes." },
+        { "replicated", "ReplicatedStorage changes", "Observe available client objects and remote definitions." },
+        { "scripts", "Script objects", "Observe script metadata where it is accessible." },
+        { "movement", "Character movement", "Sample speed settings and large position changes." },
+        { "interactions", "Tools and prompts", "Observe local tool and proximity-prompt inputs." },
+        { "errors", "Client errors", "Record available client error messages." },
+    }) do
+        local key = definition[1]
+        local frame = make("Frame", { Name = "Option" .. key, BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 70), LayoutOrder = index }, options)
+        local caption = label(frame, definition[2] .. "\n" .. definition[3], C.muted)
+        caption.Size = UDim2.new(1, -82, 0, 0)
         local current = false
-        local control = button(frame, "OFF", function() invoke(method, not current) end)
-        control.Position, control.Size = UDim2.new(1, -46, 0, 0), UDim2.fromOffset(46, 26)
+        local control = button(frame, "OFF", function() invoke("SetOption", key, not current) end, false, "Toggle" .. key)
+        control.Position, control.Size = UDim2.new(1, -72, 0, 0), UDim2.fromOffset(72, 48)
         optionSetters[key] = function(value)
             current = value == true
             control.Text = current and "ON" or "OFF"
             control.BackgroundColor3, control.TextColor3 = current and C.tealDark or C.raised, current and C.teal or C.muted
         end
     end
-    option("Include incoming server events", "SetIncludeIncoming", "includeIncoming", 3)
-    option("Scan all ReplicatedStorage remotes", "SetAllReplicated", "allReplicated", 4)
-    local filterBox = input(options, "Optional remote path/name filter; blank captures all in scope")
-    filterBox.LayoutOrder = 6
-    connect(filterBox.FocusLost, function() invoke("SetFilter", filterBox.Text) end)
-    local clear = button(options, "CLEAR RECORDING", function() invoke("Clear") end)
-    clear.LayoutOrder, clear.Size = 7, UDim2.new(1, 0, 0, 30)
-    local activity = card("LIVE EVENTS  /  SELECT TO INSPECT ARGUMENTS", 3)
-    local eventList = make("ScrollingFrame", { Name = "Events", BackgroundColor3 = C.base,
-        BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 188), LayoutOrder = 1,
-        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 3,
-        ScrollBarImageColor3 = C.teal }, activity)
-    round(eventList, 6)
-    padding(eventList, 7)
-    stack(eventList, 5)
-    local empty = label(eventList, "Paused. Start recording, then perform a task in the game.", 11, C.muted)
-    empty.Size = UDim2.new(1, -8, 0, 42)
-    local inspector = card("RECORDED EVENT DETAILS", 4)
-    inspector.Visible = false
-    local detailsHeader = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 1 }, inspector)
-    local selectedLabel = label(detailsHeader, "No event selected", 10, C.muted)
-    selectedLabel.Size, selectedLabel.TextTruncate = UDim2.new(1, -140, 1, 0), Enum.TextTruncate.AtEnd
-    selectedLabel.TextWrapped = false
-    local copy = button(detailsHeader, "COPY EVENT", function()
-        if selectedSequence then invoke("CopyEvent", selectedSequence) end
-    end)
-    copy.Position, copy.Size = UDim2.new(1, -132, 0, 0), UDim2.fromOffset(100, 26)
-    local hideDetails = button(detailsHeader, "-", function() inspector.Visible = false end)
-    hideDetails.Position, hideDetails.Size = UDim2.new(1, -24, 0, 0), UDim2.fromOffset(24, 26)
-    local detailScroll = make("ScrollingFrame", { BackgroundColor3 = C.base, BorderSizePixel = 0,
-        Size = UDim2.new(1, 0, 0, 176), LayoutOrder = 2, CanvasSize = UDim2.new(),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
-        ScrollBarThickness = 3, ScrollBarImageColor3 = C.line }, inspector)
-    round(detailScroll, 6)
-    padding(detailScroll, 8)
-    local details = make("TextBox", { BackgroundTransparency = 1, BorderSizePixel = 0,
-        Text = "Select an event above to inspect its recorded arguments.", Font = Enum.Font.Code,
-        TextSize = 11, TextColor3 = C.muted, TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, MultiLine = true,
-        TextEditable = false, ClearTextOnFocus = false, Selectable = true,
-        Size = UDim2.new(1, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y }, detailScroll)
-    local note = label(inspector, "Details are selectable. The JSON export preserves argument types and task labels for later integration.", 10, C.muted)
-    note.LayoutOrder, note.Size, note.AutomaticSize = 3, UDim2.new(1, 0, 0, 0), Enum.AutomaticSize.Y
-    local function inspect(sequence)
-        local result = invoke("Inspect", sequence)
-        if type(result) ~= "string" then return end
-        selectedSequence, detailText = sequence, result
-        inspector.Visible = true
-        selectedLabel.Text = "Event #" .. tostring(sequence) .. " / recorded arguments"
-        details.Text, details.TextColor3 = detailText, C.text
-        detailScroll.CanvasPosition = Vector2.zero
-        for key, row in pairs(rows) do row.button.BackgroundColor3 = key == sequence and C.tealDark or C.raised end
-    end
-    local function summary(value, limit)
-        local text = tostring(value or ""):gsub("[%c]", " ")
-        return #text > limit and text:sub(1, limit - 3) .. "..." or text
+    local capabilityCard = card("Tools", "CAPABILITIES", 2)
+    local capabilities = label(capabilityCard, "Checking available capabilities…", C.muted, "Capabilities")
+    capabilities.LayoutOrder = 1
+    local notes = card("Tools", "MARK A STEP", 3)
+    local markText = input(notes, "Describe the action you are about to perform", "MarkText")
+    markText.LayoutOrder = 1
+    local mark = button(notes, "ADD MARK", function() invoke("Mark", markText.Text) end, false, "AddMark")
+    mark.LayoutOrder = 2
+    local files = card("Tools", "AUTOMATIC LOG FILE", 4)
+    fileBox = input(files, "No local filename yet", "LogFilename")
+    fileBox.TextEditable, fileBox.Selectable, fileBox.LayoutOrder = false, true, 1
+    local health = label(files, "Waiting for file status.", C.muted, "LogHealth")
+    health.LayoutOrder = 2
+    local save = button(files, "SAVE PENDING LOGS", function() invoke("Save") end, false, "Save")
+    save.LayoutOrder = 3
+    local show = button(files, "SHOW LOG FILENAMES", function() invoke("ShowFiles") end, false, "ShowFiles")
+    show.LayoutOrder = 4
+    fileFeedback = label(files, "Select the filename above to copy it. Send the log and any listed parts together.", C.muted, "FileFeedback")
+    fileFeedback.LayoutOrder = 5
+    local clear = button(files, "CLEAR LIVE VIEW", function() invoke("ClearView") end, false, "ClearView")
+    clear.LayoutOrder = 6
+    label(files, "Autosave writes small batches when file access is available. Stop flushes pending events. Clearing the live view retains saved files.", C.muted).LayoutOrder = 7
+    local function removeRows(rows, retained)
+        for key, row in pairs(rows) do
+            if not retained[key] then
+                if row.connections then disconnect(row.connections) end
+                row.frame:Destroy()
+                rows[key] = nil
+            end
+        end
     end
     function dashboard:Refresh(snapshot)
         if not alive then return end
-        state = snapshot or {}
-        chip.Text, chip.TextColor3 = state.recording and "RECORDING" or "PAUSED", state.recording and C.teal or C.amber
-        run.Text, run.BackgroundColor3 = state.recording and "STOP RECORDING" or "START RECORDING", state.recording and C.amber or C.teal
-        status.Text = tostring(state.status or "Ready")
-        savedFile.Text = state.lastExport ~= nil and state.lastExport ~= "" and ("Saved log: " .. tostring(state.lastExport))
-            or "Save log writes a .log file you can send here."
-        subtitle.Text = state.label ~= nil and state.label ~= "" and summary(state.label, 80) or "Capture one manual task at a time"
-        if not taskLabel:IsFocused() then taskLabel.Text = tostring(state.label or "") end
-        if not filterBox:IsFocused() then filterBox.Text = tostring(state.filter or "") end
-        for key, set in pairs(optionSetters) do set(state[key]) end
-        metrics.Text = string.format("%s saved  /  %s in live window  /  %s outgoing  /  %s incoming  /  %ss  /  %s left window or skipped",
-            tostring(state.saved or 0), tostring(state.count or 0), tostring(state.outgoing or 0), tostring(state.incoming or 0),
-            tostring(math.floor(tonumber(state.elapsed) or 0)), tostring(state.dropped or 0))
-        local events, retained, added = state.events or {}, {}, false
-        for index = math.max(1, #events - 29), #events do
-            local event = events[index]
-            local sequence = event.sequence
-            if sequence ~= nil and not retained[sequence] then
-                retained[sequence] = true
-                local row = rows[sequence]
-                if not row then
-                    row = { connections = {} }
-                    row.button = button(eventList, "", function() inspect(sequence) end, false, row.connections)
-                    row.button.Size = UDim2.new(1, -5, 0, 52)
-                    row.heading = label(row.button, "", 10, C.text)
-                    row.heading.Position, row.heading.Size = UDim2.fromOffset(8, 5), UDim2.new(1, -16, 0, 18)
-                    row.heading.TextWrapped, row.heading.TextTruncate = false, Enum.TextTruncate.AtEnd
-                    row.summary = label(row.button, "", 10, C.muted)
-                    row.summary.Position, row.summary.Size = UDim2.fromOffset(8, 25), UDim2.new(1, -16, 0, 20)
-                    row.summary.TextWrapped, row.summary.TextTruncate = false, Enum.TextTruncate.AtEnd
-                    rows[sequence], added = row, true
+        state = type(snapshot) == "table" and snapshot or {}
+        run.Text, quick.Text = state.running and "STOP OBSERVING" or "START OBSERVING", state.running and "STOP" or "START"
+        run.BackgroundColor3, quick.BackgroundColor3 = state.running and C.amber or C.teal, state.running and C.amber or C.teal
+        phase.Text = state.running and "OBSERVING · CLIENT ONLY" or "PAUSED · CLIENT OBSERVATIONS"
+        phase.TextColor3 = state.running and C.teal or C.muted
+        reopen.Text = state.running and "OBSERVING / OPEN" or "OPEN INSPECTOR"
+        status.Text = text(state.status or "Ready", 350)
+        if not search:IsFocused() then search.Text = text(state.filter, 250) end
+        for key, set in pairs(optionSetters) do set(state.options and state.options[key]) end
+        local capture, journal, motion = state.capture or {}, state.journal or {}, state.motion or {}
+        metrics.Text = "Outgoing calls: " .. text(capture.outgoing or 0, 20) .. "  ·  Incoming events: " .. text(capture.incoming or 0, 20)
+            .. "\nSaved: " .. text(journal.saved or 0, 20) .. "  ·  Pending: " .. text(journal.pending or 0, 20)
+            .. "\nCapture dropped: " .. text(capture.queueDropped or 0, 20) .. "  ·  Discovery dropped: " .. text(capture.discoveryDropped or 0, 20)
+            .. "\nIncoming skipped: " .. text(capture.incomingSkipped or 0, 20) .. "  ·  Capture errors: " .. text(capture.errors or 0, 20)
+            .. ((capture.lastError and capture.lastError ~= "") and ("\nLast capture error: " .. text(capture.lastError, 400)) or "")
+            .. "\nMovement samples: " .. text(motion.samples or 0, 20) .. "  ·  Large position changes: " .. text(motion.jumps or 0, 20)
+            .. "\nTool events: " .. text(motion.toolEvents or 0, 20) .. "  ·  Prompt events: " .. text(motion.promptEvents or 0, 20)
+            .. "\nMotion/interaction dropped: " .. text(motion.dropped or 0, 20) .. "  ·  Errors: " .. text(motion.errors or 0, 20)
+        fileBox.Text = text(journal.baseFile, 500)
+        local fileError = text(journal.error, 600)
+        health.Text = "Storage: " .. text(journal.mode or "unavailable", 50) .. "  ·  Files: " .. text(journal.filesCount or 0, 20)
+            .. "\nSaved " .. text(journal.saved or 0, 20) .. " / Pending " .. text(journal.pending or 0, 20) .. " / Dropped " .. text(journal.dropped or 0, 20)
+            .. (fileError ~= "" and ("\nSave error: " .. fileError) or "")
+            .. (journal.partsPattern and ("\nParts: " .. text(journal.partsPattern, 500)) or "")
+        health.TextColor3 = fileError ~= "" and C.red or C.muted
+        local capabilityLines, keys = {}, {}
+        for key in pairs(state.capabilities or {}) do if type(key) == "string" then table.insert(keys, key) end end
+        table.sort(keys)
+        for index = 1, math.min(24, #keys) do
+            local key, value = keys[index], state.capabilities[keys[index]]
+            local description = value == true and "Available" or (value == false and "Unsupported" or text(value, 220))
+            table.insert(capabilityLines, text(key, 80) .. ": " .. description)
+        end
+        capabilities.Text = #capabilityLines > 0 and table.concat(capabilityLines, "\n") or "Capabilities not reported yet."
+        filterButton.Text = "EVENTS: " .. (eventFilter == "Warnings" and "WARNINGS & ERRORS" or eventFilter:upper())
+        local retainedEvents, count = {}, 0
+        local events = state.events or {}
+        for index = #events, math.max(1, #events - 39), -1 do
+            local entry = events[index]
+            if type(entry) == "table" then
+                local level = entry.level == "warn" and "warning" or entry.level
+                if eventFilter == "All" or level == "error" or (eventFilter == "Warnings" and level == "warning") then
+                    local key = entry.sequence or index
+                    if not retainedEvents[key] then
+                        retainedEvents[key], count = true, count + 1
+                        local row = eventRows[key]
+                        if not row then
+                            local frame = make("Frame", { Name = "EventRow", BackgroundColor3 = C.raised, BorderSizePixel = 0,
+                                Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y }, eventList)
+                            round(frame, 6); padding(frame, 8)
+                            row = { frame = frame, caption = label(frame, "", C.muted) }; eventRows[key] = row
+                        end
+                        row.frame.LayoutOrder = count
+                        row.caption.Text = text(entry.timestamp or "", 40) .. "  " .. text(level or "info", 12):upper()
+                            .. "  " .. text(entry.action, 100) .. "\n" .. text(entry.message, 900)
+                        row.caption.TextColor3 = level == "error" and C.red or (level == "warning" and C.amber or (level == "success" and C.teal or C.muted))
+                    end
                 end
-                row.button.LayoutOrder = index
-                row.button.BackgroundColor3 = sequence == selectedSequence and C.tealDark or C.raised
-                row.heading.Text = "#" .. tostring(sequence) .. "  " .. summary(event.direction or event.kind, 20) .. "  " .. summary(event.name, 130)
-                row.heading.TextColor3 = event.direction == "incoming" and C.amber or C.text
-                row.summary.Text = (event.label and event.label ~= "" and "[" .. summary(event.label, 50) .. "] " or "") .. summary(event.summary, 180)
             end
         end
-        for sequence, row in pairs(rows) do
-            if not retained[sequence] then clearConnections(row.connections); row.button:Destroy(); rows[sequence] = nil end
+        eventEmpty.Visible = count == 0
+        removeRows(eventRows, retainedEvents)
+        local inventory, retainedObjects, visible = state.inventory or {}, {}, 0
+        local selected = state.selected
+        selectedId = type(selected) == "table" and selected.id or nil
+        for _, item in ipairs(inventory.rows or {}) do
+            if visible >= 100 then break end
+            if type(item) == "table" and (type(item.id) == "string" or type(item.id) == "number") and not retainedObjects[item.id] then
+                local id = item.id
+                retainedObjects[id], visible = true, visible + 1
+                local row = objectRows[id]
+                if not row then
+                    row = { connections = {} }
+                    row.frame = button(objectList, "", function() invoke("InspectSelected", id) end, false, "ObjectRow", row.connections)
+                    row.frame.Size = UDim2.new(1, 0, 0, 72)
+                    row.frame.TextXAlignment = Enum.TextXAlignment.Left
+                    padding(row.frame, 8)
+                    objectRows[id] = row
+                end
+                row.frame.LayoutOrder = visible
+                row.frame.Text = text(item.path, 200) .. "\n" .. text(item.class, 60) .. " · " .. text(item.kind, 60) .. " · " .. text(item.sourceStatus, 100)
+                row.frame.BackgroundColor3 = selectedId == id and C.tealDark or C.raised
+            end
         end
-        empty.Visible = next(retained) == nil
-        if added then
-            local maxY = math.max(0, eventList.AbsoluteCanvasSize.Y - eventList.AbsoluteWindowSize.Y)
-            if maxY - eventList.CanvasPosition.Y < 90 then eventList.CanvasPosition = Vector2.new(0, maxY) end
-        end
-        -- A cleared recording invalidates the old selected argument snapshot.
-        if (state.count or 0) == 0 and selectedSequence ~= nil then
-            selectedSequence, detailText = nil, ""
-            inspector.Visible = false
-            selectedLabel.Text = "No event selected"
-            details.Text, details.TextColor3 = "Select an event above to inspect its recorded arguments.", C.muted
-        end
+        removeRows(objectRows, retainedObjects)
+        objectCount.Text = "Showing " .. visible .. " of " .. text(inventory.matched or inventory.total or #(inventory.rows or {}), 20) .. " matching objects"
+            .. ((inventory.truncated or #(inventory.rows or {}) > 100) and ". Narrow the search to see more." or ".")
+            .. "\n" .. (inventory.scanning and "Scanning…  ·  " or "") .. "Loaded: " .. text(inventory.total or 0, 20)
+            .. "  ·  Watched: " .. text(inventory.watched or 0, 20) .. " / " .. text(inventory.watchLimit or "—", 20)
+            .. "\nDiscovery dropped: " .. text(inventory.dropped or 0, 20) .. "  ·  Unreadable branches: " .. text(inventory.unreadableBranches or 0, 20)
+        if type(selected) == "table" then
+            selectedText.Text = text(selected.path, 600) .. "\n" .. text(selected.class, 100) .. " · " .. text(selected.kind, 100)
+                .. "\nSource: " .. text(selected.sourceStatus or "unavailable", 180) .. "\n" .. text(selected.summary, 1800)
+            preview.Text = text(selected.sourcePreview, 4096)
+        else selectedText.Text, preview.Text = "Select an object above.", "" end
     end
     local function viewport()
+        local safe = safeArea.AbsoluteSize
+        if safe.X > 0 and safe.Y > 0 then return safe end
         local camera = Workspace.CurrentCamera
         if camera and camera.ViewportSize.X > 0 and camera.ViewportSize.Y > 0 then return camera.ViewportSize end
         return Vector2.new(1024, 768)
@@ -896,45 +2060,52 @@ local function createRecorderDashboard(api)
     function dashboard:Resize()
         if not alive then return end
         local size = viewport()
-        local width, height = math.max(280, math.min(730, size.X - 24)), math.max(180, math.min(620, size.Y - 35))
-        window.Size = UDim2.fromOffset(width, collapsed and 62 or height)
-        content.Visible, footer.Visible, collapseButton.Text = not collapsed, not collapsed, collapsed and "+" or "-"
-        title.TextSize = width < 440 and 10 or 13
-        hotkeys.Visible = width >= 450
-        status.Size = UDim2.new(1, width >= 450 and -190 or -24, 1, 0)
+        window.Size = UDim2.fromOffset(math.max(1, math.min(740, size.X - 16)), math.max(1, math.min(660, size.Y - 16)))
+        window.Visible, launcher.Visible = not collapsed, collapsed
+        launcher.Position = UDim2.fromOffset(math.max(0, size.X - 236), 8)
         if dragged then
-            local half, center = window.AbsoluteSize / 2, window.AbsolutePosition + window.AbsoluteSize / 2
+            local half, center = window.AbsoluteSize / 2, window.AbsolutePosition + window.AbsoluteSize / 2 - safeArea.AbsolutePosition
             window.Position = UDim2.fromOffset(math.clamp(center.X, half.X, math.max(half.X, size.X - half.X)),
                 math.clamp(center.Y, half.Y, math.max(half.Y, size.Y - half.Y)))
         end
     end
     local dragging, dragInput, dragStart, windowStart
     connect(header.InputBegan, function(event)
+        if dragging then return end
         if event.UserInputType ~= Enum.UserInputType.MouseButton1 and event.UserInputType ~= Enum.UserInputType.Touch then return end
-        if event.Position.X - window.AbsolutePosition.X > window.AbsoluteSize.X - 90 then return end
+        if event.Position.X - window.AbsolutePosition.X > window.AbsoluteSize.X - 116 then return end
         dragging, dragged, dragInput = true, true, event
         dragStart = Vector2.new(event.Position.X, event.Position.Y)
         windowStart = window.AbsolutePosition + window.AbsoluteSize / 2
     end)
     connect(Input.InputChanged, function(event)
-        if not dragging or (event.UserInputType ~= Enum.UserInputType.MouseMovement and event ~= dragInput) then return end
+        if not dragging then return end
+        if dragInput.UserInputType == Enum.UserInputType.Touch then
+            if event ~= dragInput then return end
+        elseif event.UserInputType ~= Enum.UserInputType.MouseMovement then return end
         local size, half = viewport(), window.AbsoluteSize / 2
-        local center = windowStart + Vector2.new(event.Position.X, event.Position.Y) - dragStart
+        local center = windowStart + Vector2.new(event.Position.X, event.Position.Y) - dragStart - safeArea.AbsolutePosition
         window.Position = UDim2.fromOffset(math.clamp(center.X, half.X, math.max(half.X, size.X - half.X)),
             math.clamp(center.Y, half.Y, math.max(half.Y, size.Y - half.Y)))
     end)
     connect(Input.InputEnded, function(event)
-        if event == dragInput or event.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+        if event == dragInput or (dragInput and dragInput.UserInputType == Enum.UserInputType.MouseButton1
+            and event.UserInputType == Enum.UserInputType.MouseButton1) then dragging, dragInput = false, nil end
     end)
     local function watchCamera()
-        clearConnections(cameraConnections)
+        disconnect(cameraConnections)
         if Workspace.CurrentCamera then
             connect(Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), function() dashboard:Resize() end, cameraConnections)
         end
         dashboard:Resize()
     end
     connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), watchCamera)
-    function dashboard:Toggle() if alive then screen.Enabled = not screen.Enabled end end
+    connect(safeArea:GetPropertyChangedSignal("AbsoluteSize"), function() dashboard:Resize() end)
+    function dashboard:Toggle()
+        if not alive then return end
+        collapsed, dragging, dragInput = not collapsed, false, nil
+        dashboard:Resize()
+    end
     function dashboard:Destroy()
         if not alive then return end
         alive = false
@@ -943,209 +2114,240 @@ local function createRecorderDashboard(api)
         screen:Destroy()
     end
     watchCamera()
+    selectPage(currentPage)
     dashboard:Refresh(api:GetState())
     return dashboard
 end
 
-return createRecorderDashboard
+return createInspectorDashboard
 
 end)()
 
--- Minimal recorder runtime. Journal is created before the remote hook starts.
+-- Entry point: observe local runtime behavior without executing inspected code.
 if not game:IsLoaded() then game.Loaded:Wait() end
 local Players = game:GetService("Players")
-local Storage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
-local Input = game:GetService("UserInputService")
-local player = assert(Players.LocalPlayer, "Run this recorder in the Roblox client.")
+local storage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+assert(player, "Run UniversalRobloxInspector in the Roblox client.")
 local env = type(getgenv) == "function" and getgenv() or _G
-local previous = env.KarinderyaGameplayRecorder
-if type(previous) == "table" and type(previous.Destroy) == "function" then pcall(function() previous:Destroy() end) end
-local automation = env.KarinderyaAutomation
-if type(automation) == "table" then
-    if type(automation.Record) == "function" then pcall(function() automation:Record(false) end) end
-    if type(automation.Stop) == "function" then pcall(function() automation:Stop() end) end
+if type(env.UniversalRobloxInspector) == "table" and type(env.UniversalRobloxInspector.Destroy) == "function" then
+    pcall(function() env.UniversalRobloxInspector:Destroy() end)
 end
-
-local alive, engine, dashboard = true, nil, nil
-local status, label = "Preparing local log...", "Gameplay"
-local preview, previewCursor = {}, 0
-local storageError, lastQueueDropped = nil, 0
-local clipboard = env.setclipboard or setclipboard
-local sessionId = HttpService:GenerateGUID(false)
-local baseName = "karinderya-gameplay-" .. sessionId
-local metadata = { format = "karinderya-gameplay-recording", version = 3, sessionId = sessionId,
-    placeId = game.PlaceId, playerUserId = player.UserId, capturedAtUTC = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-    captureMode = "minimal-arguments-only", persistence = "immediate writes outside remote hook" }
 local api = {}
-env.KarinderyaGameplayRecorder = api
-local function message(value)
-    status = tostring(value)
-    print("[Karinderya Recorder] " .. status)
+env.UniversalRobloxInspector = api
+local alive, running, filter, selected, status = true, false, "", nil, "Ready. Start a baseline, then mark and perform the action to inspect."
+local options = { outgoing = false, incoming = false, ui = true, replicated = true, scripts = true, errors = true,
+    movement = true, interactions = true }
+local session = HttpService:GenerateGUID(false):gsub("[^%w%-_]", "")
+local journal = createInspectorJournal({ Env = env, HttpService = HttpService, sessionId = session,
+    placeId = game.PlaceId, version = "1.0", writefile = env.writefile or writefile, appendfile = env.appendfile or appendfile })
+local connections, dashboard, objectObserver, capture, motion = {}, nil, nil, nil, nil
+local sourceExports, sourceSequence = {}, 0
+local function record(level, action, message, details)
+    if not alive then return end
+    local entry = journal:Record(level, action, message, details)
+    if entry then status = entry.message end
+    return entry
 end
-local journal = createRecorderJournal({ writefile = env.writefile or writefile,
-    appendfile = env.appendfile or appendfile, readfile = env.readfile or readfile,
-    encode = function(value) return HttpService:JSONEncode(value) end,
-    metadata = metadata, baseName = baseName, maxLineBytes = 24 * 1024 })
-local prepared, preparationError = journal:Start()
-if prepared then
-    message("Log ready: " .. journal:Stats().baseFile .. ". Start recording when ready.")
-else
-    storageError = preparationError or "Could not create a log file."
-    message("Recording paused: " .. storageError)
+local function remoteRecord(entry)
+    local path = type(entry.remote) == "table" and entry.remote.path or "[unknown remote]"
+    if type(path) ~= "string" then path = "[bounded remote identity; see log]" end
+    record("info", "remote." .. tostring(entry.direction or "local"),
+        tostring(entry.method or entry.kind) .. " / " .. path, entry)
 end
-engine = createGameplayRecorder({ env = env, game = game, storage = Storage, clock = os.clock,
-    onRecord = function(event)
-        if storageError then return end
-        local ok, reason = journal:Append(event)
-        if not ok then storageError = reason or "The log could not be written." end
-    end })
-engine:SetIncludeIncoming(false)
-engine:SetLabel(label)
-
-local function active()
-    return alive and engine:Stats().recording
+capture = createInspectorCapture({ env = env, game = game, clock = os.clock, onRecord = remoteRecord })
+local extraRoots = {}
+local hiddenUI = env.gethui or gethui
+if type(hiddenUI) == "function" then
+    local ok, value = pcall(hiddenUI)
+    if ok and typeof(value) == "Instance" then table.insert(extraRoots, value) end
 end
-local function checkStorage()
-    if storageError then
-        engine:Stop()
-        message("Recording stopped: " .. storageError .. ". Existing saved log data is retained.")
-        return false
+objectObserver = createInspectorObjects({ game = game, storage = storage, options = options, record = record,
+    extraRoots = extraRoots, flush = function() journal:Flush(16) end })
+motion = createInspectorMotion({ Player = player, Workspace = game:GetService("Workspace"),
+    ProximityPromptService = game:GetService("ProximityPromptService"), options = options, now = os.clock, record = record })
+local function disconnectErrors()
+    for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+    table.clear(connections)
+end
+local errorCapability = "Not checked"
+local function connectErrors()
+    disconnectErrors()
+    if not running or not options.errors then return end
+    local ok = pcall(function()
+        local context = game:GetService("ScriptContext")
+        table.insert(connections, context.Error:Connect(function(message, trace, scriptObject)
+            if not running or not options.errors or not alive then return end
+            local pathOK, path = pcall(function() return scriptObject:GetFullName() end)
+            record("error", "script.error", type(message) == "string" and message or "Script error",
+                { scriptPath = pathOK and path or "Unavailable", trace = type(trace) == "string" and trace:sub(1, 4096) or nil })
+        end))
+    end)
+    errorCapability = ok and "ScriptContext.Error connected" or "ScriptContext.Error unavailable in this context"
+    if not ok then record("warning", "capability.errors", errorCapability) end
+end
+local function configureCapture()
+    capture:Stop()
+    if not running then return end
+    capture:SetIncludeIncoming(options.incoming)
+    local ok, reason = true, nil
+    if options.outgoing then ok, reason = capture:Start()
+    elseif options.incoming then ok, reason = capture:StartIncoming() end
+    if not ok then record("warning", "capability.remote", tostring(reason or "Remote capture unavailable")) end
+    local state = capture:Stats()
+    if options.outgoing and not state.outgoingActive then
+        record("warning", "capability.outgoing", state.outgoingError or "Outbound hooks unavailable; object observation remains active")
     end
-    return true
 end
 function api:Start()
-    if not alive or not checkStorage() then return false end
-    local stats = journal:Stats()
-    if not stats.initialized or stats.failed then message("A working file writer is required before recording."); return false end
-    local ok, reason = engine:Start()
-    if not ok then message("Recording unavailable: " .. tostring(reason)); return false end
-    engine:Note("session-state", { action = "start", mode = "minimal" })
-    if not checkStorage() then return false end
-    message("Recording. Calls are saved automatically; Save Log shows the file to send.")
+    if not alive or running then return running end
+    running = true
+    record("info", "session.start", "Observing local activity; new objects are not proof of injection", { options = options })
+    objectObserver:Start(); motion:Start(); configureCapture(); connectErrors()
     return true
 end
 function api:Stop()
     if not alive then return end
-    engine:Stop() -- drains the remaining queue into the journal
-    if checkStorage() then message("Paused. Log saved: " .. journal:Stats().baseFile) end
+    local wasRunning = running; running = false
+    -- Drain each producer separately so their combined stop-time burst cannot
+    -- evict still-pending records from another producer in a healthy journal.
+    journal:Flush(128)
+    capture:Stop(); journal:Flush(128)
+    motion:Stop(); journal:Flush(128)
+    objectObserver:Stop(); disconnectErrors()
+    if wasRunning then
+        record("info", "session.stop", "Observation stopped; saving pending log entries",
+            { remoteCapture = capture:Stats(), motion = motion:State(), serverAcceptance = "Not observable", antiCheatStatus = "Not observable" })
+    end
+    journal:Flush(128)
 end
-function api:SetLabel(value)
-    label = tostring(value or ""):gsub("[%c]", " "):sub(1, 120)
-    if label == "" then label = "Gameplay" end
-    engine:SetLabel(label)
+function api:Rescan()
+    if alive then objectObserver:Rescan() end
 end
-function api:Mark(value)
-    if value and value ~= "" then self:SetLabel(value) end
-    if not active() then message("Start recording before adding a marker."); return false end
-    engine:Flush()
-    engine:Mark(label)
-    return checkStorage()
-end
-function api:Clear()
-    self:Stop()
-    engine:Clear()
-    table.clear(preview)
-    previewCursor = engine:Stats().lastSequence
-    lastQueueDropped = 0
-    message("Live window cleared. Saved log records are retained.")
-end
-function api:SetIncludeIncoming(value)
-    engine:SetIncludeIncoming(value == true)
-end
-function api:SetAllReplicated(value)
-    engine:SetAllReplicated(value == true)
-end
-function api:SetFilter(value)
-    engine:SetFilter(tostring(value or ""):sub(1, 160))
-end
-function api:SetAutosave()
-    message("Automatic saving stays on in this recovery build.")
+function api:SetOption(key, value)
+    if type(value) ~= "boolean" or options[key] == nil then return false end
+    options[key] = value
+    record("info", "option.changed", key .. " = " .. tostring(value))
+    if key == "incoming" or key == "outgoing" then configureCapture()
+    elseif key == "errors" then connectErrors()
+    elseif key == "movement" or key == "interactions" then motion:Reconfigure(); objectObserver:Reconfigure()
+    else objectObserver:Reconfigure() end
     return true
 end
-function api:Inspect(sequence)
-    for _, event in ipairs(engine:Entries()) do
-        if event.sequence == sequence then return HttpService:JSONEncode(event) end
-    end
-    return "This event left the small live window. Its saved copy remains in the log."
+function api:SetFilter(value)
+    if type(value) ~= "string" then return false end
+    filter = value:sub(1, 160)
+    -- This is a display filter. Hidden rows/events continue to be recorded.
+    return true
 end
-function api:CopyEvent(sequence)
-    local text = self:Inspect(sequence)
+function api:Mark(value)
+    record("info", "marker", type(value) == "string" and value:sub(1, 256) or "Manual marker",
+        { running = running, meaning = "User-supplied timing marker; not source attribution" })
+end
+function api:ClearView() journal:ClearView() end
+function api:Save()
+    journal:Flush(128)
+    capture:Flush(64)
+    local ok, reason = journal:Flush(128)
+    status = ok and "Pending events saved; earlier files retained" or tostring(reason)
+    return ok and journal:ShowFile() or status
+end
+function api:ShowFiles()
+    local text = journal:ShowFile()
+    if #sourceExports > 0 then text ..= "\nSource exports:\n" .. table.concat(sourceExports, "\n") end
+    local clipboard = env.setclipboard or setclipboard
     if type(clipboard) == "function" then pcall(clipboard, text) end
+    status = text
     return text
 end
-function api:SaveLog()
-    local stats = journal:Stats()
-    if not stats.initialized then
-        message("No local log was created. " .. tostring(stats.lastError or storageError or "File writer unavailable."))
-        return nil
-    end
-    -- Display only: no queue drain, encoding, clipboard, or file access on click.
-    self.LastExport = stats.baseFile
-    message(stats.chunked and ("Send " .. stats.baseFile .. " and all matching -event*.log files.")
-        or ((stats.failed and "Partial log: " or "Log is already saved: ") .. stats.baseFile .. ". Send that file here."))
-    return stats.baseFile
+function api:InspectSelected(id)
+    local result, reason = objectObserver:Inspect(id)
+    if result then selected = result
+    else selected = nil; record("warning", "object.inspect", tostring(reason)) end
+    return result ~= nil
 end
-function api:Export() return self:SaveLog() end
+function api:ExportSource(id)
+    local source, path = objectObserver:Source(id)
+    if not source then record("warning", "source.export", path); return false end
+    local writer = env.writefile or writefile
+    if type(writer) ~= "function" then record("error", "source.export", "Source export unavailable: writefile is missing"); return false end
+    sourceSequence += 1
+    local filename = "universal-inspector-" .. session .. string.format("-source%04d.luau", sourceSequence)
+    local ok, result = pcall(writer, filename, source)
+    if not ok or result == false then record("error", "source.export", "Could not write the selected source file"); return false end
+    table.insert(sourceExports, filename)
+    if #sourceExports > 16 then table.remove(sourceExports, 1) end
+    record("info", "source.export", filename, { scriptPath = path, bytes = #source, source = "Readable Source property; unchanged text" })
+    return true
+end
 function api:GetState()
-    local stats = engine:Stats()
-    for _, event in ipairs(engine:Entries(previewCursor)) do
-        local name = event.remote and event.remote.path
-        table.insert(preview, { sequence = event.sequence, time = event.time or 0, kind = event.kind,
-            direction = event.direction, name = type(name) == "string" and name or event.kind,
-            label = event.label, summary = event.status or event.kind })
-        if #preview > 10 then table.remove(preview, 1) end
-        previewCursor = math.max(previewCursor, event.sequence)
+    local state = journal:State()
+    local events = {}
+    local needle = filter:lower()
+    for _, entry in ipairs(state.events or {}) do
+        if needle == "" or (entry.action .. " " .. entry.message):lower():find(needle, 1, true) then table.insert(events, entry) end
     end
-    local disk = journal:Stats()
-    return { recording = stats.recording, label = label, status = status, count = stats.count,
-        dropped = stats.dropped + (stats.queueDropped or 0), elapsed = stats.elapsed,
-        outgoing = stats.outgoing, incoming = stats.incoming, interactions = stats.interactions, returns = 0,
-        includeIncoming = stats.includeIncoming, allReplicated = stats.allReplicated, filter = stats.filter,
-        autosave = disk.initialized and not disk.failed, lastExport = disk.initialized and disk.baseFile or "",
-        saved = disk.saved, events = table.clone(preview) }
+    local captureState = capture:Stats()
+    local motionState = motion:State()
+    return { running = running, status = status, options = table.clone(options), filter = filter,
+        inventory = objectObserver:State(filter), selected = selected and table.clone(selected) or nil,
+        events = events, journal = state, capture = captureState, motion = motionState,
+        capabilities = {
+            outgoing = captureState.outgoingActive and "Active: game and executor namecalls" or (captureState.outgoingError or "Off; optional executor hook"),
+            incoming = captureState.incomingActive and "Active: local OnClientEvent listeners" or "Off",
+            source = "Selected readable Source only; no universal deobfuscation",
+            errors = errorCapability,
+            attribution = "Caller script when supplied; object/UI creator is unknown",
+            scope = "Local client only; streamed and accessible objects",
+            motion = tostring(motionState.status or "Waiting for character") .. "; locally observed displacement is not proof of a server-approved teleport",
+            limits = "Inventory budgets: UI 1000, scripts 800, remotes 512, other replicated 1600. Watches: UI 144, scripts 64, replicated 48. Check dropped counts.",
+        } }
 end
 function api:Destroy()
     if not alive then return end
-    engine:Stop()
-    alive = false
-    engine:Destroy()
-    if self.inputConnection then self.inputConnection:Disconnect() end
+    self:Stop()
+    capture:Destroy(); motion:Destroy(); objectObserver:Destroy()
+    record("info", "session.unload", "Inspector unloaded")
+    journal:Close(); alive = false
     if dashboard then dashboard:Destroy() end
-    if env.KarinderyaGameplayRecorder == self then env.KarinderyaGameplayRecorder = nil end
+    if env.UniversalRobloxInspector == self then env.UniversalRobloxInspector = nil end
 end
-api.inputConnection = Input.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    if input.KeyCode == Enum.KeyCode.F7 then if active() then api:Stop() else api:Start() end end
-    if input.KeyCode == Enum.KeyCode.F8 and dashboard then dashboard:Toggle() end
-    if input.KeyCode == Enum.KeyCode.F9 then api:Mark() end
-end)
-dashboard = createRecorderDashboard(api)
+record("info", "session.ready", "Runtime inspector ready; outbound and inbound remote capture start off",
+    { placeId = game.PlaceId, limits = "Local observations only; no source reconstruction guarantee" })
+dashboard = createInspectorDashboard(api)
+local nextFlush, lastDropped, lastObserverDropped = 0, 0, 0
 task.spawn(function()
     while alive do
-        if active() then
-            local ok, reason = pcall(function()
-                engine:Flush(4) -- small batches, at most 0.1 seconds between drains
-                if not checkStorage() then return end
-                local stats = engine:Stats()
-                if (stats.queueDropped or 0) > lastQueueDropped then
-                    lastQueueDropped = stats.queueDropped
-                    engine:Stop()
-                    message("Capture paused after a traffic burst. Narrow the remote filter; saved records remain in the log.")
-                end
-            end)
-            if not ok then engine:Stop(); message("Recorder paused: " .. tostring(reason):sub(1, 160)) end
+        local ok, err = pcall(function()
+            local disk = journal:State()
+            -- Let saving catch up with baseline discovery instead of immediately
+            -- flooding the queue with thousands of object records.
+            if disk.pending < 48 or disk.mode == "memory" or disk.failed then objectObserver:Tick(24) end
+            capture:Tick(60, 8)
+            motion:Tick()
+            local stats = capture:Stats()
+            if (stats.queueDropped or 0) > lastDropped then
+                lastDropped = stats.queueDropped
+                record("warning", "capture.overflow", "Remote capture queue dropped events", { dropped = lastDropped })
+            end
+            local objects = objectObserver:State()
+            if objects.dropped > lastObserverDropped then
+                lastObserverDropped = objects.dropped
+                record("warning", "objects.overflow", "Object observer dropped queued observations", { dropped = lastObserverDropped })
+            end
+        end)
+        if not ok then record("error", "inspector.tick", tostring(err)) end
+        -- Save outside observation callbacks and the namecall hook, in small batches.
+        if os.clock() >= nextFlush then
+            nextFlush = os.clock() + 0.5
+            journal:Flush(16)
         end
-        task.wait(0.1)
-    end
-end)
-task.spawn(function()
-    while alive do
         if dashboard then
-            local ok, reason = pcall(function() dashboard:Refresh(api:GetState()) end)
-            if not ok then message("Display paused: " .. tostring(reason):sub(1, 160)); break end
+            local refreshed, reason = pcall(function() dashboard:Refresh(api:GetState()) end)
+            if not refreshed then record("error", "inspector.ui", tostring(reason)) end
         end
-        task.wait(1)
+        task.wait(0.25)
     end
 end)
 return api
