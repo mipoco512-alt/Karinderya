@@ -1,7 +1,7 @@
 --==============================================================================
 --  KARINDERYA MASTER v23
 --  Auto Counter · Auto Hire (Dishwasher+Server) · Auto Clean (strict loop)
---  Auto Collect (Single-Snap TP, carry 20) · Auto Serve (+Ihaw)
+--  Auto Collect (Batch Loop + Anti-Cheat Delay, carry 20) · Auto Serve
 --  Auto Buy · Ang Pao · Auto Decor · Auto Runaway
 --
 --  Place in: StarterPlayer > StarterPlayerScripts (LocalScript)
@@ -252,14 +252,22 @@ local function standNear(pos, dist)
     return CFrame.lookAt(sp, Vector3.new(pos.X, y, pos.Z))
 end
 
+-- Used by Auto Decor.
+local function standSpot(anchor, maxRange, awayFrom, dist)
+    local cf = standNear(anchor, dist or CFG.STAND_DIST)
+    if cf then return cf end
+    return nil, "no floor spot"
+end
+
 -- STRICT SINGLE-SNAP: Sets CFrame exactly ONCE. No bunny-hop, no intermediate steps.
 local function safeTeleportCF(cf)
-    local _, hrp = charParts()
+    local _, hrp, hum = charParts()
     if not hrp then return false, "no character" end
+    if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end) end
     hrp.CFrame = cf
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
-    task.wait(0.15) -- let server register the snap
+    task.wait(math.random(15, 25) / 100) -- 0.15 to 0.25s randomized wait
     return true
 end
 
@@ -869,7 +877,7 @@ local function trashTick()
                     progressed = true
                     M.trash.status = "threw bag #" .. throws .. " (" .. tostring(how) .. ")"
                     log("trash", "threw bag #" .. throws .. " (" .. tostring(how) .. ")", THEME.green)
-                    task.wait(math.random(15, 30) / 100) -- Randomized throw delay
+                    task.wait(math.random(15, 30) / 100)
                 elseif ok then
                     TRASH.fails += 1
                     M.trash.status = "throw failed " .. TRASH.fails .. "/3: " .. tostring(how)
@@ -948,7 +956,7 @@ local function trashTick()
 end
 
 --==========================================================================
--- AUTO COLLECT (Single Snap TP)
+-- AUTO COLLECT (Batch Collect with Anti-Cheat)
 --==========================================================================
 local function heldFoods()
     local out = {}
@@ -973,7 +981,7 @@ local function pressGet(prompt)
     pcall(function() prompt:InputHoldBegin() end)
     task.wait(math.random(1, 3) / 100)
     pcall(function() prompt:InputHoldEnd() end)
-    pcall(function() prompt.MaxActivationDistance = orig) end)
+    pcall(function() prompt.MaxActivationDistance = orig end)
     return true
 end
 local function collectOne(entry)
@@ -983,10 +991,15 @@ local function collectOne(entry)
     local before = countHeldFoods()
     local _, hrp = charParts()
     if not hrp then return false, "no character" end
+    
+    -- Random jitter in exact standing location to avoid robotic anti-cheat flags
+    local jitter = Vector3.new(math.random(-10, 10) / 10, 0, math.random(-10, 10) / 10)
+    local targetPos = pos + jitter
+
     if not inReach(prompt) then
-        local ok, why = safeTeleport(pos, prompt.MaxActivationDistance)
+        local ok, why = safeTeleport(targetPos, prompt.MaxActivationDistance)
         if not ok then return false, why end
-        task.wait(math.random(10, 20) / 100)
+        task.wait(math.random(15, 30) / 100)
     end
     for _ = 1, 3 do
         if not (prompt.Parent and prompt.Enabled) then break end
@@ -1020,7 +1033,7 @@ local function getReadyFoodList()
                         if normName(prompt.ActionText) == key and prompt.ObjectText:match("^Table") then
                             local r
                             if (COL.skip[prompt] or 0) > now then r = "cooling down"
-                            elseif now - COL.seen[model] < 0.6 then r = "plate just appeared"
+                            elseif now - COL.seen[model] < 0.5 then r = "plate just appeared"
                             elseif now - COL.since[prompt] < CFG.READY_SETTLE then r = "Get settling"
                             elseif COL.missed[prompt] and not COL.wentOff[prompt] and now - COL.missed[prompt] < CFG.MISS_RETRY then
                                 r = "Get not available again yet"
@@ -1035,47 +1048,70 @@ local function getReadyFoodList()
     end
     return list, why
 end
+
+-- BATCH LOOP: Collects everything available before returning.
 local function collectTick()
     if countHeldFoods() >= CFG.MAX_CARRY then
         M.collect.status = "carry full (" .. CFG.MAX_CARRY .. ")"
         return 1
     end
-    local ready, why = getReadyFoodList()
-    if #ready == 0 then
-        M.collect.status = why and ("waiting: " .. why) or "no food ready"
+
+    local collectedAny = false
+    local batchStart = os.clock()
+
+    -- Keep collecting all available food (Max 8 seconds per batch to not starve other modules)
+    while countHeldFoods() < CFG.MAX_CARRY and os.clock() - batchStart < 8 do
+        local ready, why = getReadyFoodList()
+        if #ready == 0 then
+            if not collectedAny then
+                M.collect.status = why and ("waiting: " .. why) or "no food ready"
+            end
+            break
+        end
+
+        local _, hrp = charParts()
+        table.sort(ready, function(a, b)
+            local pa, pb = promptAnchor(a.prompt), promptAnchor(b.prompt)
+            local da = (hrp and pa) and (hrp.Position - pa).Magnitude or math.huge
+            local db = (hrp and pb) and (hrp.Position - pb).Magnitude or math.huge
+            return da < db
+        end)
+
+        local e = ready[1]
+        wants("collect")
+        local before = {}
+        for _, f in ipairs(heldFoods()) do before[f] = true end
+
+        local ok, res, reason = withMove("collect", function() return collectOne(e) end)
+        if ok and res then
+            counts.collected += 1
+            local target = targetOf(e.model)
+            for _, f in ipairs(heldFoods()) do
+                if not before[f] then S.tableOf[f] = target end
+            end
+            COL.missed[e.prompt] = nil
+            COL.wentOff[e.prompt] = nil
+            M.collect.status = "got " .. tostring(e.dish) .. " (" .. countHeldFoods() .. " total)"
+            log("collect", "got " .. tostring(e.dish), THEME.green)
+            collectedAny = true
+            
+            -- HUMAN DELAY: wait 0.4s to 0.8s between pickups to avoid anti-cheat
+            task.wait(math.random(40, 80) / 100)
+        else
+            COL.skip[e.prompt] = os.clock() + 2
+            COL.missed[e.prompt] = os.clock()
+            COL.wentOff[e.prompt] = false
+            M.collect.status = "missed " .. tostring(e.dish) .. ": " .. tostring(reason)
+            task.wait(0.3)
+            break -- Break the loop if we fail, let it retry next tick
+        end
+    end
+
+    if collectedAny then
+        return 0.3
+    else
         return 1
     end
-    local _, hrp = charParts()
-    table.sort(ready, function(a, b)
-        local pa, pb = promptAnchor(a.prompt), promptAnchor(b.prompt)
-        local da = (hrp and pa) and (hrp.Position - pa).Magnitude or math.huge
-        local db = (hrp and pb) and (hrp.Position - pb).Magnitude or math.huge
-        return da < db
-    end)
-    local e = ready[1]
-    wants("collect")
-    local before = {}
-    for _, f in ipairs(heldFoods()) do before[f] = true end
-    local ok, res, reason = withMove("collect", function() return collectOne(e) end)
-    if not ok then M.collect.status = tostring(res) return 0.5 end
-    if res then
-        counts.collected += 1
-        local target = targetOf(e.model)
-        for _, f in ipairs(heldFoods()) do
-            if not before[f] then S.tableOf[f] = target end
-        end
-        COL.missed[e.prompt] = nil
-        COL.wentOff[e.prompt] = nil
-        M.collect.status = "got " .. tostring(e.dish) .. " (" .. countHeldFoods() .. " total)"
-        log("collect", "got " .. tostring(e.dish), THEME.green)
-        -- Random delay between 0.2s and 0.45s to avoid rapid-fire teleport flags
-        return math.random(20, 45) / 100
-    end
-    COL.skip[e.prompt] = os.clock() + 2
-    COL.missed[e.prompt] = os.clock()
-    COL.wentOff[e.prompt] = false
-    M.collect.status = "missed " .. tostring(e.dish) .. ": " .. tostring(reason)
-    return 0.4
 end
 
 --==========================================================================
