@@ -2,8 +2,6 @@
 --  KARINDERYA MASTER v24
 --  Auto Counter · Auto Hire · Auto Clean · Auto Collect · Auto Serve
 --  Auto Buy · Ang Pao · Auto Decor · Auto Runaway · Auto Hit Sleeping
---
---  Place in: StarterPlayer > StarterPlayerScripts (LocalScript)
 --==============================================================================
 
 local Players           = game:GetService("Players")
@@ -17,6 +15,7 @@ local HttpService       = game:GetService("HttpService")
 local Me        = Players.LocalPlayer
 local PlayerGui = Me:WaitForChild("PlayerGui")
 pcall(function() ReplicatedStorage:WaitForChild("Remotes", 10) end)
+
 local VERSION   = "v24"
 local running   = true
 
@@ -75,16 +74,52 @@ local REJECT_LIST = { Steamer = true, Common = true, Classic = true }
 local function normName(s) return (tostring(s):lower():gsub("[^%w]", "")) end
 local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
 local function finite(v) return v.X == v.X and v.Y == v.Y and v.Z == v.Z and math.abs(v.X) < 1e5 end
-local function hasWord(s, words) for _, w in ipairs(words) do if s:find(w, 1, true) then return true end end return false end
-local function waitFor(fn, timeout) local t0 = os.clock() repeat local v = fn() if v then return v end task.wait(0.05) until os.clock() - t0 >= timeout return nil end
-local function countKeys(t) local n = 0 for _ in pairs(t) do n += 1 end return n end
-local function summarize(v, depth) depth = depth or 0 local t = typeof(v) if t == "Instance" then return v.ClassName .. ":" .. v.Name end if t ~= "table" then return tostring(v) end if depth >= 2 then return "{...}" end local parts, n = {}, 0 for k, val in pairs(v) do n += 1 if n > 8 then table.insert(parts, "...") break end table.insert(parts, tostring(k) .. "=" .. summarize(val, depth + 1)) end return "{" .. table.concat(parts, ", ") .. "}" end
+local function hasWord(s, words) 
+    for _, w in ipairs(words) do 
+        if s:find(w, 1, true) then return true end 
+    end 
+    return false 
+end
+
+local function waitFor(fn, timeout) 
+    local t0 = os.clock() 
+    repeat 
+        local v = fn() 
+        if v then return v end 
+        task.wait(0.05) 
+    until os.clock() - t0 >= timeout 
+    return nil 
+end
+
+local function countKeys(t) 
+    local n = 0 
+    for _ in pairs(t) do n += 1 end 
+    return n 
+end
+
+local function summarize(v, depth) 
+    depth = depth or 0 
+    local t = typeof(v) 
+    if t == "Instance" then return v.ClassName .. ":" .. v.Name end 
+    if t ~= "table" then return tostring(v) end 
+    if depth >= 2 then return "{...}" end 
+    local parts, n = {}, 0 
+    for k, val in pairs(v) do 
+        n += 1 
+        if n > 8 then table.insert(parts, "...") break end 
+        table.insert(parts, tostring(k) .. "=" .. summarize(val, depth + 1)) 
+    end 
+    return "{" .. table.concat(parts, ", ") .. "}" 
+end
 
 local function anchorOf(inst)
     if not inst then return nil end
     if inst:IsA("Attachment") then return inst.WorldPosition end
     if inst:IsA("BasePart") then return inst.Position end
-    if inst:IsA("Model") then local ok, cf = pcall(function() return inst:GetBoundingBox() end) if ok and cf then return cf.Position end end
+    if inst:IsA("Model") then 
+        local ok, cf = pcall(function() return inst:GetBoundingBox() end) 
+        if ok and cf then return cf.Position end 
+    end
     local part = inst:FindFirstChildWhichIsA("BasePart", true)
     return part and part.Position or nil
 end
@@ -115,11 +150,20 @@ end
 local function parseAny(v, out, depth, seen)
     if v == nil or depth > 5 then return end
     local t = typeof(v)
-    if t == "Instance" then local pos = anchorOf(v) if pos and finite(pos) then table.insert(out, { pos = pos, inst = v }) end
-    elseif t == "Vector3" then if finite(v) then table.insert(out, { pos = v }) end
-    elseif t == "CFrame" then if finite(v.Position) then table.insert(out, { pos = v.Position }) end
-    elseif t == "table" then if seen[v] then return end seen[v] = true for _, val in pairs(v) do parseAny(val, out, depth + 1, seen) end end
+    if t == "Instance" then 
+        local pos = anchorOf(v) 
+        if pos and finite(pos) then table.insert(out, { pos = pos, inst = v }) end
+    elseif t == "Vector3" then 
+        if finite(v) then table.insert(out, { pos = v }) end
+    elseif t == "CFrame" then 
+        if finite(v.Position) then table.insert(out, { pos = v.Position }) end
+    elseif t == "table" then 
+        if seen[v] then return end 
+        seen[v] = true 
+        for _, val in pairs(v) do parseAny(val, out, depth + 1, seen) end 
+    end
 end
+
 local function parseReply(v) local out = {} parseAny(v, out, 0, {}) return out end
 
 local function nearestOf(list)
@@ -128,7 +172,10 @@ local function nearestOf(list)
     local best, bestD
     for _, p in ipairs(list) do
         local pos = promptAnchor(p)
-        if pos then local d = hrp and (hrp.Position - pos).Magnitude or 0 if not bestD or d < bestD then best, bestD = p, d end end
+        if pos then 
+            local d = hrp and (hrp.Position - pos).Magnitude or 0 
+            if not bestD or d < bestD then best, bestD = p, d end 
+        end
     end
     return best
 end
@@ -153,36 +200,85 @@ local function remote(name)
     if r and r.Parent then return r end
     local root = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage
     r = root:FindFirstChild(name, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then RCACHE[name] = r return r end
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then 
+        RCACHE[name] = r 
+        return r 
+    end
     return nil
 end
+
 local function invoke(name, ...)
-    local rf = remote(name) if not rf or not rf:IsA("RemoteFunction") then return false, "missing" end
-    local args = table.pack(...) local done, ok, res = false, false, nil
-    task.spawn(function() ok, res = pcall(function() return rf:InvokeServer(table.unpack(args, 1, args.n)) end) done = true end)
-    local t0 = os.clock() while not done and os.clock() - t0 < CFG.REMOTE_TIMEOUT do task.wait(0.05) end
+    local rf = remote(name) 
+    if not rf or not rf:IsA("RemoteFunction") then return false, "missing" end
+    local args = table.pack(...) 
+    local done, ok, res = false, false, nil
+    task.spawn(function() 
+        ok, res = pcall(function() return rf:InvokeServer(table.unpack(args, 1, args.n)) end) 
+        done = true 
+    end)
+    local t0 = os.clock() 
+    while not done and os.clock() - t0 < CFG.REMOTE_TIMEOUT do task.wait(0.05) end
     if not done then return false, "timeout" end
     return ok, res
 end
+
 local function fireRemote(name, ...)
-    local r = remote(name) if not r or not r:IsA("RemoteEvent") then return false, "missing" end
-    local args = table.pack(...) return pcall(function() r:FireServer(table.unpack(args, 1, args.n)) end)
+    local r = remote(name) 
+    if not r or not r:IsA("RemoteEvent") then return false, "missing" end
+    local args = table.pack(...) 
+    return pcall(function() r:FireServer(table.unpack(args, 1, args.n)) end)
 end
+
 local HOOKS = {}
 local function onEvent(name, fn)
-    local r = remote(name) if r and r:IsA("RemoteEvent") then table.insert(HOOKS, r.OnClientEvent:Connect(function(...) local ok, err = pcall(fn, ...) if not ok then log("event", name .. ": " .. tostring(err), THEME.red) end end)) return true end
+    local r = remote(name) 
+    if r and r:IsA("RemoteEvent") then 
+        table.insert(HOOKS, r.OnClientEvent:Connect(function(...) 
+            local ok, err = pcall(fn, ...) 
+            if not ok then log("event", name .. ": " .. tostring(err), THEME.red) end 
+        end)) 
+        return true 
+    end
     return false
 end
 
 --==========================================================================
--- MOVEMENT (STRICT SINGLE-SNAP TELEPORT)
+-- MOVEMENT
 --==========================================================================
-local function containers() local out = {} if Me.Character then table.insert(out, Me.Character) end local bp = Me:FindFirstChild("Backpack") if bp then table.insert(out, bp) end return out end
-local function charParts() local char = Me.Character local hrp = char and char:FindFirstChild("HumanoidRootPart") local hum = char and char:FindFirstChildOfClass("Humanoid") if hrp and hum and hum.Health > 0 then return char, hrp, hum end return nil, nil, nil end
+local function containers() 
+    local out = {} 
+    if Me.Character then table.insert(out, Me.Character) end 
+    local bp = Me:FindFirstChild("Backpack") 
+    if bp then table.insert(out, bp) end 
+    return out 
+end
+
+local function charParts() 
+    local char = Me.Character 
+    local hrp = char and char:FindFirstChild("HumanoidRootPart") 
+    local hum = char and char:FindFirstChildOfClass("Humanoid") 
+    if hrp and hum and hum.Health > 0 then return char, hrp, hum end 
+    return nil, nil, nil 
+end
 
 local MOVE = { owner = nil, saved = nil }
-local function freezeWalk() local _, _, hum = charParts() if hum and not MOVE.saved then MOVE.saved = { hum.WalkSpeed, hum.JumpPower, hum.JumpHeight } hum.WalkSpeed, hum.JumpPower, hum.JumpHeight = 0, 0, 0 end end
-local function thawWalk() local hum = Me.Character and Me.Character:FindFirstChildOfClass("Humanoid") if MOVE.saved and hum then hum.WalkSpeed = MOVE.saved[1] > 0 and MOVE.saved[1] or 16 hum.JumpPower = MOVE.saved[2] > 0 and MOVE.saved[2] or 50 hum.JumpHeight = MOVE.saved[3] > 0 and MOVE.saved[3] or 7.2 end MOVE.saved = nil end
+local function freezeWalk() 
+    local _, _, hum = charParts() 
+    if hum and not MOVE.saved then 
+        MOVE.saved = { hum.WalkSpeed, hum.JumpPower, hum.JumpHeight } 
+        hum.WalkSpeed, hum.JumpPower, hum.JumpHeight = 0, 0, 0 
+    end 
+end
+
+local function thawWalk() 
+    local hum = Me.Character and Me.Character:FindFirstChildOfClass("Humanoid") 
+    if MOVE.saved and hum then 
+        hum.WalkSpeed = MOVE.saved[1] > 0 and MOVE.saved[1] or 16 
+        hum.JumpPower = MOVE.saved[2] > 0 and MOVE.saved[2] or 50 
+        hum.JumpHeight = MOVE.saved[3] > 0 and MOVE.saved[3] or 7.2 
+    end 
+    MOVE.saved = nil 
+end
 
 local PRIO = { runaway = false, want = {} }
 local PRIO_ORDER = { runaway = 1, sleeping = 2, drink = 3, serve = 4, collect = 5, ihaw = 6, trash = 7, angpao = 8, decor = 9 }
@@ -203,8 +299,13 @@ local function withMove(owner, fn)
     local allowed, blocker = gateOK(owner)
     if not allowed then return false, "waiting: " .. tostring(blocker) end
     if MOVE.owner and MOVE.owner ~= owner then return false, "busy: " .. MOVE.owner end
-    MOVE.owner = owner freezeWalk() local ok, x, y = pcall(fn) thawWalk() MOVE.owner = nil
-    if not ok then error(x, 0) end return true, x, y
+    MOVE.owner = owner 
+    freezeWalk() 
+    local ok, x, y = pcall(fn) 
+    thawWalk() 
+    MOVE.owner = nil
+    if not ok then error(x, 0) end 
+    return true, x, y
 end
 
 local function pressPromptFast(prompt, isServing)
@@ -313,34 +414,75 @@ local function ownedByMe(inst)
     local keys = { [Me.Name] = true, [Me.DisplayName] = true, [tostring(Me.UserId)] = true }
     if keys[inst.Name] then return true end
     for _, v in pairs(inst:GetAttributes()) do if keys[tostring(v)] then return true end end
-    for _, ch in ipairs(inst:GetChildren()) do if ch:IsA("ValueBase") then local ok, val = pcall(function() return ch.Value end) if ok and (val == Me or keys[tostring(val)]) then return true end end end
+    for _, ch in ipairs(inst:GetChildren()) do 
+        if ch:IsA("ValueBase") then 
+            local ok, val = pcall(function() return ch.Value end) 
+            if ok and (val == Me or keys[tostring(val)]) then return true end 
+        end 
+    end
     return false
 end
+
 local function plotGet()
     if PLOT.locked and PLOT.locked.Parent then return PLOT.locked end
     if PLOT.cache and PLOT.cache.Parent and os.clock() - PLOT.at < 5 then return PLOT.cache end
-    PLOT.at = os.clock() local hrp = Me.Character and Me.Character:FindFirstChild("HumanoidRootPart") local best, bestOwned, bestD
+    PLOT.at = os.clock() 
+    local hrp = Me.Character and Me.Character:FindFirstChild("HumanoidRootPart") 
+    local best, bestOwned, bestD
     for _, c in ipairs(Workspace:GetChildren()) do
         if (c:IsA("Model") or c:IsA("Folder")) and c:FindFirstChild("Serve") and c:FindFirstChild("DiningPlot1") then
-            local owned = ownedByMe(c) local p = anchorOf(c:FindFirstChild("Serve")) local d = (hrp and p) and (hrp.Position - p).Magnitude or math.huge
-            if not best or (owned and not bestOwned) or (owned == bestOwned and d < bestD) then best, bestOwned, bestD = c, owned, d end
+            local owned = ownedByMe(c) 
+            local p = anchorOf(c:FindFirstChild("Serve")) 
+            local d = (hrp and p) and (hrp.Position - p).Magnitude or math.huge
+            if not best or (owned and not bestOwned) or (owned == bestOwned and d < bestD) then 
+                best, bestOwned, bestD = c, owned, d 
+            end
         end
     end
-    if best ~= PLOT.cache then PLOT.cache = best if best then log("plot", "using " .. best.Name .. (bestOwned and " (owner match)" or " (nearest)"), THEME.blue) end end
+    if best ~= PLOT.cache then 
+        PLOT.cache = best 
+        if best then log("plot", "using " .. best.Name .. (bestOwned and " (owner match)" or " (nearest)"), THEME.blue) end 
+    end
     return best
 end
+
 local function tablesOfPlot(plot)
-    local out = {} if not plot then return out end local folders = {} for _, f in ipairs(plot:GetChildren()) do if f.Name:match("^DiningPlot") then table.insert(folders, f) end end
+    local out = {} 
+    if not plot then return out end 
+    local folders = {} 
+    for _, f in ipairs(plot:GetChildren()) do 
+        if f.Name:match("^DiningPlot") then table.insert(folders, f) end 
+    end
     table.sort(folders, function(a, b) return a.Name < b.Name end)
-    for _, f in ipairs(folders) do local list = {} for _, t in ipairs(f:GetChildren()) do local n = tonumber(t.Name:match("^Table(%d+)$")) if n then table.insert(list, { n = n, t = t }) end end table.sort(list, function(a, b) return a.n < b.n end) for _, e in ipairs(list) do table.insert(out, e.t) end end
+    for _, f in ipairs(folders) do 
+        local list = {} 
+        for _, t in ipairs(f:GetChildren()) do 
+            local n = tonumber(t.Name:match("^Table(%d+)$")) 
+            if n then table.insert(list, { n = n, t = t }) end 
+        end 
+        table.sort(list, function(a, b) return a.n < b.n end) 
+        for _, e in ipairs(list) do table.insert(out, e.t) end 
+    end
     return out
 end
+
 local NIGHT = { value = false, source = "?", at = -math.huge }
 local function nightNow()
     if os.clock() - NIGHT.at < 3 then return NIGHT.value, NIGHT.source end
-    NIGHT.at = os.clock() local clock = Lighting.ClockTime local value, source = (clock >= 18 or clock < 6), string.format("clock %.1f", clock)
-    local plot = PLOT.cache if plot then for _, p in ipairs(plot:GetDescendants()) do if p:IsA("ProximityPrompt") and p.Enabled and normName(p.ActionText):find("closednight", 1, true) then value, source = true, "store prompt" break end end end
-    NIGHT.value, NIGHT.source = value, source return value, source
+    NIGHT.at = os.clock() 
+    local clock = Lighting.ClockTime 
+    local value, source = (clock >= 18 or clock < 6), string.format("clock %.1f", clock)
+    local plot = PLOT.cache 
+    if plot then 
+        for _, p in ipairs(plot:GetDescendants()) do 
+            if p:IsA("ProximityPrompt") and p.Enabled and normName(p.ActionText):find("closednight", 1, true) then 
+                value, source = true, "store prompt" 
+                break 
+            end 
+        end 
+    end
+    NIGHT.value, NIGHT.source = value, source 
+    return value, source
 end
 
 --==========================================================================
@@ -360,7 +502,6 @@ local BUY = { cd = {}, dumped = false, bought = 0 }
 local COL = { skip = setmetatable({}, { __mode = "k" }), seen = setmetatable({}, { __mode = "k" }), since = setmetatable({}, { __mode = "k" }), why = "-", got = 0, missed = setmetatable({}, { __mode = "k" }), wentOff = setmetatable({}, { __mode = "k" }) }
 local counts = { collected = 0, served = 0, drinks = 0, bought = 0 }
 
--- NEW: FOOD EVENTS (Speeds up Collect & Serve)
 local FOOD_EVENTS = {
     placed = setmetatable({}, { __mode = "k" }),
     recentPlaced = 0,
@@ -387,7 +528,6 @@ local function parseFoodEvent(...)
     return model, tbl, npc, dish, insts
 end
 
--- NEW: SLEEPING WORKERS STATE
 local SLEEP = { targets = {}, caught = {}, lastScan = -math.huge, dumpAt = -math.huge }
 local SLEEP_ATTRS = { "IsSleeping", "Sleeping", "IsAsleep", "Asleep", "Sleep", "Resting", "KnockedOut" }
 local SLEEP_NAME_WORDS = { "sleep", "asleep", "rest", "sleeping" }
@@ -395,37 +535,114 @@ local SLEEP_NAME_WORDS = { "sleep", "asleep", "rest", "sleeping" }
 --==========================================================================
 -- AUTO COUNTER
 --==========================================================================
-local function rarityOf(base) if not base then return nil end for r, set in pairs(RARITY) do if set[base] then return r end end return nil end
-local function counterPlot() if C.plotName then local m = Workspace:FindFirstChild(C.plotName) if m then return m end end return plotGet() end
+local function rarityOf(base) 
+    if not base then return nil end 
+    for r, set in pairs(RARITY) do 
+        if set[base] then return r end 
+    end 
+    return nil 
+end
+
+local function counterPlot() 
+    if C.plotName then 
+        local m = Workspace:FindFirstChild(C.plotName) 
+        if m then return m end 
+    end 
+    return plotGet() 
+end
+
 local function scanUiSeats()
     local found, res = false, {}
-    for _, d in ipairs(PlayerGui:GetDescendants()) do if d:IsA("TextLabel") then local tn, sn = d.Text:match("^%s*(Table%d+)%s*%(Seat%s*(%d+)%)%s*$") if tn then found = true local avail = false if d.Parent then for _, s in ipairs(d.Parent:GetChildren()) do if s:IsA("TextLabel") and s.Text:lower():match("^%s*available%s*$") then avail = true break end end end res[tn .. "|" .. sn] = avail end end end
+    for _, d in ipairs(PlayerGui:GetDescendants()) do 
+        if d:IsA("TextLabel") then 
+            local tn, sn = d.Text:match("^%s*(Table%d+)%s*%(Seat%s*(%d+)%)%s*$") 
+            if tn then 
+                found = true 
+                local avail = false 
+                if d.Parent then 
+                    for _, s in ipairs(d.Parent:GetChildren()) do 
+                        if s:IsA("TextLabel") and s.Text:lower():match("^%s*available%s*$") then 
+                            avail = true 
+                            break 
+                        end 
+                    end 
+                end 
+                res[tn .. "|" .. sn] = avail 
+            end 
+        end 
+    end
     C.ui = found and res or nil
 end
+
 local function counterCandidates()
-    local tabs = tablesOfPlot(counterPlot()) local total = #tabs * CFG.SEATS local now, free, rest = os.clock(), {}, {}
-    for k = 0, total - 1 do local slot = (C.cursor + k) % total local t = tabs[math.floor(slot / CFG.SEATS) + 1] local seat = slot % CFG.SEATS + 1 if t and t.Parent then local occ = C.occ[t:GetFullName() .. "|" .. seat] local busy = occ and (now - occ.t) < CFG.OCC_TTL local ui = C.ui and C.ui[t.Name .. "|" .. seat] local e = { slot = slot, tbl = t, seat = seat } if busy or ui == false then table.insert(rest, e) else table.insert(free, e) end end end
+    local tabs = tablesOfPlot(counterPlot()) 
+    local total = #tabs * CFG.SEATS 
+    local now, free, rest = os.clock(), {}, {}
+    for k = 0, total - 1 do 
+        local slot = (C.cursor + k) % total 
+        local t = tabs[math.floor(slot / CFG.SEATS) + 1] 
+        local seat = slot % CFG.SEATS + 1 
+        if t and t.Parent then 
+            local occ = C.occ[t:GetFullName() .. "|" .. seat] 
+            local busy = occ and (now - occ.t) < CFG.OCC_TTL 
+            local ui = C.ui and C.ui[t.Name .. "|" .. seat] 
+            local e = { slot = slot, tbl = t, seat = seat } 
+            if busy or ui == false then 
+                table.insert(rest, e) 
+            else 
+                table.insert(free, e) 
+            end 
+        end 
+    end
     for _, e in ipairs(rest) do table.insert(free, e) end
     return free, total
 end
+
 local function assignSeat(npcId, tbl, seat)
-    local rf = remote("AssignNPC") if not rf or not rf:IsA("RemoteEvent") then return nil, "AssignNPC missing" end
-    local uuid = HttpService:GenerateGUID(false) C.pending[uuid] = false
+    local rf = remote("AssignNPC") 
+    if not rf or not rf:IsA("RemoteEvent") then return nil, "AssignNPC missing" end
+    local uuid = HttpService:GenerateGUID(false) 
+    C.pending[uuid] = false
     rf:FireServer({ Seat = seat, NpcId = npcId, Slot = tbl }, uuid)
-    local t0 = os.clock() while C.pending[uuid] == false and os.clock() - t0 < CFG.RESULT_TIMEOUT do task.wait() end
-    local res = C.pending[uuid] C.pending[uuid] = nil
+    local t0 = os.clock() 
+    while C.pending[uuid] == false and os.clock() - t0 < CFG.RESULT_TIMEOUT do task.wait() end
+    local res = C.pending[uuid] 
+    C.pending[uuid] = nil
     if res == false then return nil, "no reply" end
     return res
 end
+
 local function counterSweep(npcId)
-    local cands, total = counterCandidates() if #cands == 0 then return false, "no tables in plot" end
-    for _, e in ipairs(cands) do if not M.counter.enabled then return false, "stopped" end if e.tbl.Parent then local res, why = assignSeat(npcId, e.tbl, e.seat) if res and res.Success then C.cursor = (e.slot + 1) % total return true, e.tbl.Name .. " S" .. e.seat end if res then C.lastReject = summarize(res) local wait_ = CFG.MIN_DELAY local retry = tonumber(res.RetryAfter) if retry then wait_ = math.max(wait_, retry + 0.03) end task.wait(wait_) else C.lastReject = tostring(why) task.wait(CFG.MIN_DELAY) end end end
+    local cands, total = counterCandidates() 
+    if #cands == 0 then return false, "no tables in plot" end
+    for _, e in ipairs(cands) do 
+        if not M.counter.enabled then return false, "stopped" end 
+        if e.tbl.Parent then 
+            local res, why = assignSeat(npcId, e.tbl, e.seat) 
+            if res and res.Success then 
+                C.cursor = (e.slot + 1) % total 
+                return true, e.tbl.Name .. " S" .. e.seat 
+            end 
+            if res then 
+                C.lastReject = summarize(res) 
+                local wait_ = CFG.MIN_DELAY 
+                local retry = tonumber(res.RetryAfter) 
+                if retry then wait_ = math.max(wait_, retry + 0.03) end 
+                task.wait(wait_) 
+            else 
+                C.lastReject = tostring(why) 
+                task.wait(CFG.MIN_DELAY) 
+            end 
+        end 
+    end
     return false, "no seat accepted"
 end
+
 local REJECT_FORMS = {
     function(rf, id, uuid) rf:FireServer({ NpcId = id }, uuid) end,
     function(rf, id, uuid) rf:FireServer(id, uuid) end,
 }
+
 local function rejectOnCounter(npcId)
     local rf = remote("RejectNPC")
     if not rf or not rf:IsA("RemoteEvent") then return false, "RejectNPC not found" end
@@ -450,15 +667,22 @@ local function rejectOnCounter(npcId)
     end
     return false, lastReply or "no answer from RejectNPC"
 end
+
 local function counterTick()
     scanUiSeats()
     local ok, info = invoke("GetCounterInfo")
-    if not ok or type(info) ~= "table" or not info.NpcId then M.counter.status = "waiting for a customer" return 0.6 end
+    if not ok or type(info) ~= "table" or not info.NpcId then 
+        M.counter.status = "waiting for a customer" 
+        return 0.6 
+    end
     if type(info.PlotName) == "string" then C.plotName = info.PlotName end
     local npcId, now = info.NpcId, os.clock()
     local label = tostring(info.TemplateName or "NPC")
     local rar = rarityOf(label)
-    if (C.handled[npcId] or 0) > now then M.counter.status = "waiting (already handled)" return 0.6 end
+    if (C.handled[npcId] or 0) > now then 
+        M.counter.status = "waiting (already handled)" 
+        return 0.6 
+    end
     if rar and REJECT_LIST[rar] then
         M.counter.status = "rejecting " .. label .. " (" .. rar .. ")"
         local okR, how = rejectOnCounter(npcId)
@@ -474,30 +698,63 @@ local function counterTick()
         return 0.3
     end
     M.counter.status = "assigning " .. label
-    local seated, what = counterSweep(npcId) C.handled[npcId] = now + (seated and CFG.SEATED_BLOCK or CFG.FAIL_BLOCK)
-    if seated then M.counter.status = "seated " .. label .. " @ " .. tostring(what) log("counter", "seated " .. label .. " @ " .. tostring(what), THEME.green) return 0.3 end
-    M.counter.status = "no seat: " .. tostring(what) log("counter", label .. ": " .. tostring(what) .. (C.lastReject and (" | " .. C.lastReject) or ""), THEME.orange) return 1
+    local seated, what = counterSweep(npcId) 
+    C.handled[npcId] = now + (seated and CFG.SEATED_BLOCK or CFG.FAIL_BLOCK)
+    if seated then 
+        M.counter.status = "seated " .. label .. " @ " .. tostring(what) 
+        log("counter", "seated " .. label .. " @ " .. tostring(what), THEME.green) 
+        return 0.3 
+    end
+    M.counter.status = "no seat: " .. tostring(what) 
+    log("counter", label .. ": " .. tostring(what) .. (C.lastReject and (" | " .. C.lastReject) or ""), THEME.orange) 
+    return 1
 end
 
 --==========================================================================
 -- AUTO HIRE
 --==========================================================================
 local HIRE = { seen = setmetatable({}, { __mode = "k" }), cache = {}, cacheAt = -math.huge, fullFail = {} }
-local function openRoles() local out = {} for _, r in ipairs(ROLES) do if not H.filled[r] then table.insert(out, r) end end return out end
-local function rolesText() local parts = {} for _, r in ipairs(ROLES) do table.insert(parts, r:sub(1, 1) .. (H.filled[r] and "+" or "-")) end return table.concat(parts, " ") end
-local function canRoll()
-    local now = os.clock() local keep = {} for _, t in ipairs(H.rolls) do if now - t < 60 then table.insert(keep, t) end end H.rolls = keep local last = keep[#keep] or -math.huge return #keep < CFG.ROLL_PER_MIN and now - last >= CFG.ROLL_COOLDOWN
+
+local function openRoles() 
+    local out = {} 
+    for _, r in ipairs(ROLES) do 
+        if not H.filled[r] then table.insert(out, r) end 
+    end 
+    return out 
 end
+
+local function rolesText() 
+    local parts = {} 
+    for _, r in ipairs(ROLES) do 
+        table.insert(parts, r:sub(1, 1) .. (H.filled[r] and "+" or "-")) 
+    end 
+    return table.concat(parts, " ") 
+end
+
+local function canRoll()
+    local now = os.clock() 
+    local keep = {} 
+    for _, t in ipairs(H.rolls) do 
+        if now - t < 60 then table.insert(keep, t) end 
+    end 
+    H.rolls = keep 
+    local last = keep[#keep] or -math.huge 
+    return #keep < CFG.ROLL_PER_MIN and now - last >= CFG.ROLL_COOLDOWN
+end
+
 local function rejectWorker(name)
     if remote("RejectWorker") then fireRemote("RejectWorker", name) end
     if remote("FireNpcWorker") then fireRemote("FireNpcWorker", name) end
     if remote("FireStaff") then fireRemote("FireStaff", name) end
     log("hire", "rejected " .. name, THEME.red)
 end
+
 local function scanWorkers()
     if os.clock() - HIRE.cacheAt < 0.8 then
         local keep = {}
-        for _, w in ipairs(HIRE.cache) do if w.model:IsDescendantOf(Workspace) then table.insert(keep, w) end end
+        for _, w in ipairs(HIRE.cache) do 
+            if w.model:IsDescendantOf(Workspace) then table.insert(keep, w) end 
+        end
         HIRE.cache = keep
         return keep
     end
@@ -518,6 +775,7 @@ local function scanWorkers()
     HIRE.cache = out
     return out
 end
+
 local function targetsFor()
     local now, out = os.clock(), {}
     for _, w in ipairs(scanWorkers()) do
@@ -534,6 +792,7 @@ local function targetsFor()
     end
     return out
 end
+
 local function hireWith(w, role)
     local reply = "no answer"
     for _ = 1, 3 do
@@ -545,6 +804,7 @@ local function hireWith(w, role)
     end
     return false, reply
 end
+
 local function hireTick()
     H.staffSource = "workspace"
     if #openRoles() == 0 then
@@ -602,6 +862,7 @@ end
 -- AUTO CLEAN
 --==========================================================================
 local THROW_WORDS = { "throw", "dump", "toss", "deposit", "dispose" }
+
 local function findGarbageTruck()
     local _, hrp = charParts()
     local best, bestD = nil, math.huge
@@ -614,11 +875,17 @@ local function findGarbageTruck()
         if obj:IsA("ProximityPrompt") then
             local cur, truckNamed = obj.Parent, nil
             while cur and cur ~= Workspace do
-                if (cur:IsA("Model") or cur:IsA("Folder")) and normName(cur.Name):find("truck", 1, true) then truckNamed = cur break end
+                if (cur:IsA("Model") or cur:IsA("Folder")) and normName(cur.Name):find("truck", 1, true) then 
+                    truckNamed = cur 
+                    break 
+                end
                 cur = cur.Parent
             end
-            if truckNamed then consider(truckNamed)
-            elseif normName(obj.ObjectText):find("truck", 1, true) and obj.Parent and obj.Parent ~= Workspace then consider(obj.Parent) end
+            if truckNamed then 
+                consider(truckNamed)
+            elseif normName(obj.ObjectText):find("truck", 1, true) and obj.Parent and obj.Parent ~= Workspace then 
+                consider(obj.Parent) 
+            end
         elseif obj:IsA("Model") or obj:IsA("BasePart") then
             local n = normName(obj.Name)
             if n:find("garbagetruck", 1, true) or n:find("trashtruck", 1, true) or n:find("dumptruck", 1, true) then
@@ -626,7 +893,10 @@ local function findGarbageTruck()
             elseif n == "truck" then
                 local p = obj.Parent
                 while p and p ~= Workspace do
-                    if normName(p.Name):find("garbagetruck", 1, true) then consider(obj) break end
+                    if normName(p.Name):find("garbagetruck", 1, true) then 
+                        consider(obj) 
+                        break 
+                    end
                     p = p.Parent
                 end
             end
@@ -634,6 +904,7 @@ local function findGarbageTruck()
     end
     return best
 end
+
 local function printTruckDiagnostics()
     if os.clock() - (TRASH.dbgAt or -math.huge) < 20 then return end
     TRASH.dbgAt = os.clock()
@@ -650,12 +921,15 @@ local function printTruckDiagnostics()
         end
     end
 end
+
 local BAG = { skip = setmetatable({}, { __mode = "k" }), item = nil }
+
 local function isBagName(name)
     local n = tostring(name):lower():gsub("%s+", "")
     if n:find("hat", 1, true) or n:find("christmas", 1, true) or n:find("elf", 1, true) or n:find("backpack", 1, true) then return false end
     return n:match("^bag%d*$") ~= nil or n:find("garbagebag", 1, true) ~= nil or n:find("trashbag", 1, true) ~= nil
 end
+
 local function inventorySet()
     local set = {}
     for _, c in ipairs(containers()) do
@@ -665,6 +939,7 @@ local function inventorySet()
     end
     return set
 end
+
 local function heldBag()
     local item = BAG.item
     if item and item.Parent and (item.Parent == Me.Character or item.Parent == Me:FindFirstChild("Backpack")) then return item end
@@ -679,6 +954,7 @@ local function heldBag()
     end
     return nil
 end
+
 local function worldBagPrompt()
     local _, hrp = charParts()
     local now, best, bestD = os.clock(), nil, math.huge
@@ -693,6 +969,7 @@ local function worldBagPrompt()
     end
     return best
 end
+
 local function findWorldBag()
     local _, hrp = charParts()
     local now, best, bestD = os.clock(), nil, math.huge
@@ -708,6 +985,7 @@ local function findWorldBag()
     end
     return best
 end
+
 local function countWorldBags()
     local n = 0
     for _, obj in ipairs(Workspace:GetDescendants()) do
@@ -718,6 +996,7 @@ local function countWorldBags()
     end
     return n
 end
+
 local function useTrashPrompt(targetObj)
     local prompt = targetObj:FindFirstChildWhichIsA("ProximityPrompt", true)
     local click  = targetObj:FindFirstChildWhichIsA("ClickDetector", true)
@@ -733,6 +1012,7 @@ local function useTrashPrompt(targetObj)
     if click then pcall(fireclickdetector, click) end
     task.wait(0.5)
 end
+
 local function isRegularTrash(obj)
     if not obj or not obj.Parent or not (obj:IsA("Model") or obj:IsA("BasePart")) then return false end
     if isBagName(obj.Name) then return false end
@@ -740,23 +1020,14 @@ local function isRegularTrash(obj)
     local click  = obj:FindFirstChildWhichIsA("ClickDetector", true)
     if not prompt and not click then return false end
     local parent = obj.Parent
-    while parent do if parent.Name == "GlobalTrashSpawner" then return true end parent = parent.Parent end
+    while parent do 
+        if parent.Name == "GlobalTrashSpawner" then return true end 
+        parent = parent.Parent 
+    end
     local name = obj.Name:lower()
     return name:find("trash") or name:find("dirt") or name:find("plastic")
 end
-local function throwPromptOf(truck)
-    local firstThrow, firstEnabled, fallback
-    for _, p in ipairs(truck:GetDescendants()) do
-        if p:IsA("ProximityPrompt") then
-            if hasWord(normName(p.ActionText), THROW_WORDS) then
-                if p.Enabled then firstEnabled = firstEnabled or p end
-                firstThrow = firstThrow or p
-            end
-            fallback = fallback or p
-        end
-    end
-    return firstEnabled or firstThrow or fallback
-end
+
 local function throwBagToTruck(truck, bag)
     local char, hrp, hum = charParts()
     if not char or not hrp then return false, "no character" end
@@ -811,6 +1082,7 @@ local function throwBagToTruck(truck, bag)
     if #prompts == 0 then return false, "truck has no throw prompt" end
     return false, "throw not confirmed"
 end
+
 local function pickBagOnce(prompt)
     local pos = promptAnchor(prompt)
     if not pos then
@@ -828,7 +1100,12 @@ local function pickBagOnce(prompt)
     local before = inventorySet()
     local function picked()
         if not prompt.Parent then return true end
-        for t in pairs(inventorySet()) do if not before[t] then BAG.item = t return true end end
+        for t in pairs(inventorySet()) do 
+            if not before[t] then 
+                BAG.item = t 
+                return true 
+            end 
+        end
         return false
     end
     for _ = 1, 3 do
@@ -841,6 +1118,7 @@ local function pickBagOnce(prompt)
     BAG.skip[prompt] = os.clock() + 2
     return false, "pickup not confirmed"
 end
+
 local function truckPresent()
     local truck = findGarbageTruck()
     if truck then
@@ -856,10 +1134,14 @@ local function truckPresent()
     T.truckArrivalTime = nil
     return false
 end
+
 local function trashTick()
     if isRunawayActive() then return 0.5 end
     local char, hrp, hum = charParts()
-    if not hrp then M.trash.status = "no character" return 1 end
+    if not hrp then 
+        M.trash.status = "no character" 
+        return 1 
+    end
     local truckOk = truckPresent()
     local truck = T.truck
     local isNight = nightNow()
@@ -996,12 +1278,15 @@ local function heldFoods()
     end
     return out
 end
+
 local function countHeldFoods() return #heldFoods() end
+
 local function targetOf(cooked)
     local tv = cooked:FindFirstChild("TargetTableSlot", true)
     if tv and tv:IsA("ObjectValue") and tv.Value and tv.Value.Parent then return tv.Value end
     return nil
 end
+
 local function pressGet(prompt)
     if not prompt or not prompt.Parent or not prompt.Enabled then return false end
     local orig = prompt.MaxActivationDistance
@@ -1013,6 +1298,7 @@ local function pressGet(prompt)
     pcall(function() prompt.MaxActivationDistance = orig end)
     return true
 end
+
 local function collectOne(entry)
     local prompt = entry.prompt
     local pos = promptAnchor(prompt)
@@ -1040,6 +1326,7 @@ local function collectOne(entry)
     end
     return false, "Get not confirmed"
 end
+
 local function getReadyFoodList()
     local list, why = {}, nil
     local plot = plotGet()
@@ -1062,14 +1349,21 @@ local function getReadyFoodList()
                         COL.since[prompt] = COL.since[prompt] or now
                         if normName(prompt.ActionText) == key and prompt.ObjectText:match("^Table") then
                             local r
-                            if (COL.skip[prompt] or 0) > now then r = "cooling down"
-                            elseif now - COL.seen[model] < (evt and 0.1 or 0.5) then r = "plate just appeared"
-                            elseif now - COL.since[prompt] < fastSettle then r = "Get settling"
+                            if (COL.skip[prompt] or 0) > now then 
+                                r = "cooling down"
+                            elseif now - COL.seen[model] < (evt and 0.1 or 0.5) then 
+                                r = "plate just appeared"
+                            elseif now - COL.since[prompt] < fastSettle then 
+                                r = "Get settling"
                             elseif COL.missed[prompt] and not COL.wentOff[prompt] and now - COL.missed[prompt] < CFG.MISS_RETRY then
                                 r = "Get not available again yet"
                             end
-                            if r then why = r
-                            else table.insert(list, { model = model, prompt = prompt, dish = dish, evt = evt }) break end
+                            if r then 
+                                why = r
+                            else 
+                                table.insert(list, { model = model, prompt = prompt, dish = dish, evt = evt }) 
+                                break 
+                            end
                         end
                     end
                 end
@@ -1078,6 +1372,7 @@ local function getReadyFoodList()
     end
     return list, why
 end
+
 local function collectTick()
     if countHeldFoods() >= CFG.MAX_CARRY then
         M.collect.status = "carry full (" .. CFG.MAX_CARRY .. ")"
@@ -1139,6 +1434,7 @@ end
 -- AUTO SERVE + DRINK + IHAW (UPDATED WITH FOOD EVENT)
 --==========================================================================
 local DRINK_WORDS = { "kola", "loyal", "drink", "soda", "cola", "juice", "sprite" }
+
 local function heldDrinkName()
     for _, c in ipairs(containers()) do
         for _, t in ipairs(c:GetChildren()) do
@@ -1150,6 +1446,7 @@ local function heldDrinkName()
     end
     return nil
 end
+
 local function drinkOrderWaiting()
     local now = os.clock()
     for npc in pairs(S.pendingDrinks) do
@@ -1157,6 +1454,7 @@ local function drinkOrderWaiting()
     end
     return nil
 end
+
 local function drinkStep()
     local now = os.clock()
     if (S.drinkFailAt or 0) > now then return nil end
@@ -1190,17 +1488,20 @@ local function drinkStep()
     M.serve.status = "drink give refused, retrying soon"
     return 0.5
 end
+
 local function dishKey(s)
     local base = normName(s)
     local k = base:gsub("cooked", ""):gsub("inihaw", ""):gsub("ihaw", "")
     if #k == 0 then return base end
     return k
 end
+
 local function dishMatch(a, b)
     if a == b then return true end
     if #a >= 4 and #b >= 4 and (a:find(b, 1, true) or b:find(a, 1, true)) then return true end
     return false
 end
+
 local function servePromptsIn(inst)
     local out = {}
     for _, d in ipairs(inst:GetDescendants()) do
@@ -1208,9 +1509,11 @@ local function servePromptsIn(inst)
     end
     return out
 end
+
 local function dishOfPrompt(p)
     return dishKey((p.ActionText:gsub("^%s*[Ss]erve%s*", "")))
 end
+
 local function ihawSections()
     local out, plot = {}, plotGet()
     if not plot then return out end
@@ -1221,6 +1524,7 @@ local function ihawSections()
     end
     return out
 end
+
 local function findServeFor(acc)
     local key = dishKey(acc:GetAttribute("OrderKey") or acc.Name)
     local target = nil
@@ -1250,11 +1554,13 @@ local function findServeFor(acc)
     for _, sec in ipairs(ihawSections()) do scan(sec, 0.5) end
     return bestEnabled or bestDisabled
 end
+
 local function presentInHand(acc)
     if acc.Parent == nil then return false end
     local bp = Me:FindFirstChild("Backpack")
     return acc.Parent == Me.Character or (bp ~= nil and acc.Parent == bp)
 end
+
 local function serveFood(acc, p)
     local pos = promptAnchor(p)
     if not pos then return false, "no prompt anchor" end
@@ -1294,6 +1600,7 @@ local function serveFood(acc, p)
     end
     return false, "could not serve"
 end
+
 local function heldFoodsWithServe()
     local now = os.clock()
     for _, acc in ipairs(heldFoods()) do
@@ -1304,13 +1611,17 @@ local function heldFoodsWithServe()
     end
     return nil, nil
 end
+
 local function foodStep()
     local acc, p = heldFoodsWithServe()
     if not acc then return nil end
     local dish = tostring(acc:GetAttribute("OrderKey") or acc.Name)
     wants("serve")
     local ok, res, why = withMove("serve", function() return serveFood(acc, p) end)
-    if not ok then M.serve.status = tostring(res) return 0.5 end
+    if not ok then 
+        M.serve.status = tostring(res) 
+        return 0.5 
+    end
     if res then
         S.served += 1
         counts.served += 1
@@ -1323,6 +1634,7 @@ local function foodStep()
     log("serve", M.serve.status, THEME.orange)
     return 0.5
 end
+
 local function ihawPromptOf()
     if S.ihawAt and os.clock() - S.ihawAt < 1 then return S.ihawPrompt end
     S.ihawAt = os.clock()
@@ -1334,7 +1646,10 @@ local function ihawPromptOf()
             local obj, act = normName(p.ObjectText), normName(p.ActionText)
             local inIhaw, cur = false, p.Parent
             while cur and cur ~= Workspace do
-                if normName(cur.Name):find("ihaw", 1, true) then inIhaw = true break end
+                if normName(cur.Name):find("ihaw", 1, true) then 
+                    inIhaw = true 
+                    break 
+                end
                 cur = cur.Parent
             end
             local isCook = obj == "ihaw" or act == "cookhotdog"
@@ -1349,6 +1664,7 @@ local function ihawPromptOf()
     S.ihawPrompt = best
     return best
 end
+
 local function ihawStep()
     if (S.ihawFailAt or 0) > os.clock() then return nil end
     local p = ihawPromptOf()
@@ -1359,7 +1675,10 @@ local function ihawStep()
         pressPromptFast(p, false)
         return true, "cooked"
     end)
-    if not ok then M.serve.status = tostring(res) return 0.5 end
+    if not ok then 
+        M.serve.status = tostring(res) 
+        return 0.5 
+    end
     if not res then
         S.ihawFailAt = os.clock() + 5
         M.serve.status = "IHAW: " .. tostring(why)
@@ -1368,8 +1687,12 @@ local function ihawStep()
     M.serve.status = "IHAW: cooking"
     return 0.8
 end
+
 local function serveTick()
-    if not plotGet() then M.serve.status = "no plot found" return 2 end
+    if not plotGet() then 
+        M.serve.status = "no plot found" 
+        return 2 
+    end
     local r = drinkStep()
     if r then return r end
     r = foodStep()
@@ -1441,6 +1764,7 @@ local function groceryTitle()
     end
     return nil
 end
+
 local function guiVisible(inst)
     local o = inst
     while o and o ~= PlayerGui do
@@ -1450,12 +1774,39 @@ local function guiVisible(inst)
     end
     return o == PlayerGui
 end
-local function groceryOpen() local t = groceryTitle() return t ~= nil and guiVisible(t) end
-local function groceryGui() local o = groceryTitle() while o and not o:IsA("ScreenGui") do o = o.Parent end return o end
-local function buyCount(c) local n = 0 for _, b in ipairs(c:GetDescendants()) do if b:IsA("TextButton") and normName(b.Text):sub(1, 3) == "buy" then n += 1 end end return n end
-local function nameIn(c) for _, t in ipairs(c:GetDescendants()) do if t:IsA("TextLabel") and t.Text:match("^%s*%a[%a ]+%s*$") then local n = normName(t.Text) if #n >= 3 and not BUY_SKIP[n] then return (t.Text:match("^%s*(.-)%s*$")) end end end return nil end
+
+local function groceryOpen() 
+    local t = groceryTitle() 
+    return t ~= nil and guiVisible(t) 
+end
+
+local function groceryGui() 
+    local o = groceryTitle() 
+    while o and not o:IsA("ScreenGui") do o = o.Parent end 
+    return o 
+end
+
+local function buyCount(c) 
+    local n = 0 
+    for _, b in ipairs(c:GetDescendants()) do 
+        if b:IsA("TextButton") and normName(b.Text):sub(1, 3) == "buy" then n += 1 end 
+    end 
+    return n 
+end
+
+local function nameIn(c) 
+    for _, t in ipairs(c:GetDescendants()) do 
+        if t:IsA("TextLabel") and t.Text:match("^%s*%a[%a ]+%s*$") then 
+            local n = normName(t.Text) 
+            if #n >= 3 and not BUY_SKIP[n] then return (t.Text:match("^%s*(.-)%s*$")) end 
+        end 
+    end 
+    return nil 
+end
+
 local function groceryCards()
-    local g = groceryGui() if not g or not groceryOpen() then return {} end
+    local g = groceryGui() 
+    if not g or not groceryOpen() then return {} end
     local cards, seen = {}, {}
     for _, lbl in ipairs(g:GetDescendants()) do
         local pct = lbl:IsA("TextLabel") and lbl.Visible and tonumber(lbl.Text:match("^%s*(%d+)%%%s*$"))
@@ -1465,14 +1816,21 @@ local function groceryCards()
                 if not card or card == g then break end
                 local nb = buyCount(card)
                 if nb > 1 then break end
-                if nb == 1 then name = nameIn(card) if name then break end end
+                if nb == 1 then 
+                    name = nameIn(card) 
+                    if name then break end 
+                end
                 card = card.Parent
             end
-            if name and card and card ~= g and not seen[card] then seen[card] = true table.insert(cards, { name = name, pct = pct, pctLabel = lbl }) end
+            if name and card and card ~= g and not seen[card] then 
+                seen[card] = true 
+                table.insert(cards, { name = name, pct = pct, pctLabel = lbl }) 
+            end
         end
     end
     return cards
 end
+
 local function printGroceryTexts(g)
     if os.clock() - (BUY.dbgAt or -math.huge) < 20 then return end
     BUY.dbgAt = os.clock()
@@ -1486,12 +1844,14 @@ local function printGroceryTexts(g)
         end
     end
 end
+
 local function readPct(lbl)
     local ok, txt = pcall(function() return lbl.Text end)
     if not ok or type(txt) ~= "string" then return nil end
     local d = txt:match("(%d+)%%")
     return d and tonumber(d) or nil
 end
+
 local function restockItem(card, key)
     local bought, stall, last = 0, 0, card.pct
     while bought < CFG.BUY_MAX_UNITS do
@@ -1509,6 +1869,7 @@ local function restockItem(card, key)
     end
     return bought, nil
 end
+
 local function counterPrompt()
     local grocery = Workspace:FindFirstChild("Grocery")
     local inner = grocery and grocery:FindFirstChild("Grocery")
@@ -1517,6 +1878,7 @@ local function counterPrompt()
     if p and p:IsA("ProximityPrompt") then return p end
     return nil
 end
+
 local function buyTick()
     if not groceryOpen() then
         if CFG.BUY_USE_COUNTER_PROMPT and os.clock() - (BUY.openAt or -math.huge) > 20 then
@@ -1525,7 +1887,8 @@ local function buyTick()
             if prompt then
                 M.buy.status = "opening the Grocery"
                 local ok, opened = withMove("buy", function()
-                    goToPrompt(prompt) pressPromptFast(prompt, false)
+                    goToPrompt(prompt) 
+                    pressPromptFast(prompt, false)
                     return waitFor(groceryOpen, 2.0) ~= nil
                 end)
                 if not ok then M.buy.status = tostring(opened) return 1 end
@@ -1564,15 +1927,110 @@ end
 -- ANG PAO
 --==========================================================================
 local NAME_HIT = {}
-local function apNameHit(name) local h = NAME_HIT[name] if h == nil then h = hasWord(normName(name), CFG.AP_PATTERNS) NAME_HIT[name] = h end return h end
+local function apNameHit(name) 
+    local h = NAME_HIT[name] 
+    if h == nil then 
+        h = hasWord(normName(name), CFG.AP_PATTERNS) 
+        NAME_HIT[name] = h 
+    end 
+    return h 
+end
+
 local function apKey(pos) return string.format("%d,%d,%d", math.floor(pos.X), math.floor(pos.Y), math.floor(pos.Z)) end
-local function addAP(pos, inst, src) if not pos or not finite(pos) then return end local now = os.clock() for _, k in ipairs(AP.known) do if (inst ~= nil and k.inst == inst) or (k.pos - pos).Magnitude < 2.5 then k.pos = pos if inst then k.inst = inst end k.seen, k.src = now, src return end end table.insert(AP.known, { pos = pos, inst = inst, seen = now, src = src }) end
-local function removeAP(pos, inst) for i = #AP.known, 1, -1 do local k = AP.known[i] if (inst ~= nil and k.inst == inst) or (pos ~= nil and (k.pos - pos).Magnitude < 3) then table.remove(AP.known, i) end end end
-local function pruneAP() local now = os.clock() for i = #AP.known, 1, -1 do local k = AP.known[i] if (k.inst and not k.inst.Parent) or now - k.seen > 60 then table.remove(AP.known, i) end end end
-local function nearestAP() local _, hrp = charParts() if not hrp then return nil end local now, best, bestD = os.clock(), nil, nil for _, k in ipairs(AP.known) do if (AP.attempt[apKey(k.pos)] or 0) <= now then local d = (hrp.Position - k.pos).Magnitude if not bestD or d < bestD then best, bestD = k, d end end end return best, bestD end
-local function scanAP() local char = Me.Character for _, obj in ipairs(Workspace:GetDescendants()) do if (obj:IsA("BasePart") or obj:IsA("Model")) and apNameHit(obj.Name) and not (char and obj:IsDescendantOf(char)) then local pos = anchorOf(obj) if pos and finite(pos) then addAP(pos, obj, "scan") end end end end
-local function pollAP() local t0 = os.clock() local ok, res = invoke("GetAngpaos") if not ok then return false, tostring(res) end if not AP.polled then AP.polled = true print("[Karinderya][AngPao] GetAngpaos reply:", typeof(res), summarize(res)) end for _, f in ipairs(parseReply(res)) do addAP(f.pos, f.inst, "poll") end for i = #AP.known, 1, -1 do local k = AP.known[i] if k.src == "poll" and k.seen < t0 then table.remove(AP.known, i) end end return true end
-local function debugNearby() local _, hrp = charParts() if not hrp then return end print("[Karinderya][AngPao] nothing found. Touch/prompt objects within 40 studs:") local shown = 0 for _, obj in ipairs(Workspace:GetDescendants()) do if shown >= 25 then break end if obj:IsA("BasePart") or obj:IsA("Model") then local pos = anchorOf(obj) if pos and finite(pos) and (pos - hrp.Position).Magnitude <= 40 then local touch = obj:FindFirstChildWhichIsA("TouchTransmitter", true) ~= nil local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true) ~= nil if touch or prompt then shown += 1 print(string.format("  %s [%s] %.0f studs touch=%s prompt=%s", obj:GetFullName(), obj.ClassName, (pos - hrp.Position).Magnitude, tostring(touch), tostring(prompt))) end end end end if shown == 0 then print("  (none) - the ang pao may not be a Part/Model with a touch or prompt") end end
+local function addAP(pos, inst, src) 
+    if not pos or not finite(pos) then return end 
+    local now = os.clock() 
+    for _, k in ipairs(AP.known) do 
+        if (inst ~= nil and k.inst == inst) or (k.pos - pos).Magnitude < 2.5 then 
+            k.pos = pos 
+            if inst then k.inst = inst end 
+            k.seen, k.src = now, src 
+            return 
+        end 
+    end 
+    table.insert(AP.known, { pos = pos, inst = inst, seen = now, src = src }) 
+end
+
+local function removeAP(pos, inst) 
+    for i = #AP.known, 1, -1 do 
+        local k = AP.known[i] 
+        if (inst ~= nil and k.inst == inst) or (pos ~= nil and (k.pos - pos).Magnitude < 3) then 
+            table.remove(AP.known, i) 
+        end 
+    end 
+end
+
+local function pruneAP() 
+    local now = os.clock() 
+    for i = #AP.known, 1, -1 do 
+        local k = AP.known[i] 
+        if (k.inst and not k.inst.Parent) or now - k.seen > 60 then 
+            table.remove(AP.known, i) 
+        end 
+    end 
+end
+
+local function nearestAP() 
+    local _, hrp = charParts() 
+    if not hrp then return nil end 
+    local now, best, bestD = os.clock(), nil, nil 
+    for _, k in ipairs(AP.known) do 
+        if (AP.attempt[apKey(k.pos)] or 0) <= now then 
+            local d = (hrp.Position - k.pos).Magnitude 
+            if not bestD or d < bestD then best, bestD = k, d end 
+        end 
+    end 
+    return best, bestD 
+end
+
+local function scanAP() 
+    local char = Me.Character 
+    for _, obj in ipairs(Workspace:GetDescendants()) do 
+        if (obj:IsA("BasePart") or obj:IsA("Model")) and apNameHit(obj.Name) and not (char and obj:IsDescendantOf(char)) then 
+            local pos = anchorOf(obj) 
+            if pos and finite(pos) then addAP(pos, obj, "scan") end 
+        end 
+    end 
+end
+
+local function pollAP() 
+    local t0 = os.clock() 
+    local ok, res = invoke("GetAngpaos") 
+    if not ok then return false, tostring(res) end 
+    if not AP.polled then 
+        AP.polled = true 
+        print("[Karinderya][AngPao] GetAngpaos reply:", typeof(res), summarize(res)) 
+    end 
+    for _, f in ipairs(parseReply(res)) do addAP(f.pos, f.inst, "poll") end 
+    for i = #AP.known, 1, -1 do 
+        local k = AP.known[i] 
+        if k.src == "poll" and k.seen < t0 then table.remove(AP.known, i) end 
+    end 
+    return true 
+end
+
+local function debugNearby() 
+    local _, hrp = charParts() 
+    if not hrp then return end 
+    print("[Karinderya][AngPao] nothing found. Touch/prompt objects within 40 studs:") 
+    local shown = 0 
+    for _, obj in ipairs(Workspace:GetDescendants()) do 
+        if shown >= 25 then break end 
+        if obj:IsA("BasePart") or obj:IsA("Model") then 
+            local pos = anchorOf(obj) 
+            if pos and finite(pos) and (pos - hrp.Position).Magnitude <= 40 then 
+                local touch = obj:FindFirstChildWhichIsA("TouchTransmitter", true) ~= nil 
+                local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true) ~= nil 
+                if touch or prompt then 
+                    shown += 1 
+                    print(string.format("  %s [%s] %.0f studs touch=%s prompt=%s", obj:GetFullName(), obj.ClassName, (pos - hrp.Position).Magnitude, tostring(touch), tostring(prompt))) 
+                end 
+            end 
+        end 
+    end 
+    if shown == 0 then print("  (none) - the ang pao may not be a Part/Model with a touch or prompt") end 
+end
+
 local function collectAP(t)
     AP.attempt[apKey(t.pos)] = os.clock() + CFG.AP_RETRY
     local ok = safeTeleport(t.pos, 10)
@@ -1592,38 +2050,214 @@ local function collectAP(t)
     AP.collected += 1
     return true
 end
+
 local function apTick()
-    if not charParts() then M.angpao.status = "no character" return 1 end
-    local now = os.clock() if now - AP.lastScan >= CFG.AP_SCAN then AP.lastScan = now scanAP() end
-    if now - AP.lastPoll >= CFG.AP_POLL then AP.lastPoll = now pollAP() end
-    pruneAP() local best, d = nearestAP()
-    if not best then if #AP.known > 0 then M.angpao.status = #AP.known .. " known, cooling down" else M.angpao.status = "none found (see console)" if not AP.idle then AP.idle = true debugNearby() end end return 1 end
-    AP.idle = false local ok, res = withMove("angpao", function() return collectAP(best) end)
-    if not ok then M.angpao.status = tostring(res) return 0.6 end
-    M.angpao.status = string.format("collected (%d total, %.0f studs)", AP.collected, d or 0) return 0.1
+    if not charParts() then 
+        M.angpao.status = "no character" 
+        return 1 
+    end
+    local now = os.clock() 
+    if now - AP.lastScan >= CFG.AP_SCAN then 
+        AP.lastScan = now 
+        scanAP() 
+    end
+    if now - AP.lastPoll >= CFG.AP_POLL then 
+        AP.lastPoll = now 
+        pollAP() 
+    end
+    pruneAP() 
+    local best, d = nearestAP()
+    if not best then 
+        if #AP.known > 0 then 
+            M.angpao.status = #AP.known .. " known, cooling down" 
+        else 
+            M.angpao.status = "none found (see console)" 
+            if not AP.idle then 
+                AP.idle = true 
+                debugNearby() 
+            end 
+        end 
+        return 1 
+    end
+    AP.idle = false 
+    local ok, res = withMove("angpao", function() return collectAP(best) end)
+    if not ok then 
+        M.angpao.status = tostring(res) 
+        return 0.6 
+    end
+    M.angpao.status = string.format("collected (%d total, %.0f studs)", AP.collected, d or 0) 
+    return 0.1
 end
 
 --==========================================================================
 -- AUTO DECOR
 --==========================================================================
-local function snapAcc() local set = {} local char = Me.Character if char then for _, c in ipairs(char:GetChildren()) do if c:IsA("Accessory") then set[c] = true end end end return set end
-local function newAcc(before) local char = Me.Character if not char then return nil end for _, c in ipairs(char:GetChildren()) do if c:IsA("Accessory") and not before[c] then return c end end return nil end
-local function holdingDecor() local char = Me.Character if not char then return false end if DC.held and DC.held.Parent == char then return true end for _, c in ipairs(char:GetChildren()) do if c:IsA("Accessory") then local n = normName(c.Name) for key in pairs(DC.keys) do if n:find(key, 1, true) then return true end end end end return false end
-local function doPickup() local folder = Workspace:FindFirstChild("ChristmasTreePickups") if not folder then return false, "ChristmasTreePickups missing" end local now, list, total = os.clock(), {}, 0 for _, p in ipairs(folder:GetDescendants()) do if p:IsA("ProximityPrompt") and p.Enabled and normName(p.ActionText):find("pick", 1, true) then total += 1 local o = normName(p.ObjectText) if #o > 0 then DC.keys[o] = true end if (DC.skip[p] or 0) < now then table.insert(list, p) end end end DC.left = total if total == 0 then return false, "no decor left" end if #list == 0 then return false, "all " .. total .. " pickups cooling down" end local prompt = nearestOf(list) local label = (prompt.ObjectText ~= "" and prompt.ObjectText) or "decor" local before = snapAcc() local ok, why = goToPrompt(prompt) if not ok then DC.skip[prompt] = now + 15 return false, label .. ": " .. tostring(why) end local function got() return holdingDecor() or newAcc(before) ~= nil end for _ = 1, 3 do if not (prompt.Parent and prompt.Enabled) then break end press(prompt) if waitFor(got, 1.0) then DC.held = newAcc(before) or DC.held DC.picked += 1 return true, "picked " .. label end end local part = prompt.Parent and (prompt.Parent:IsA("BasePart") and prompt.Parent or prompt.Parent:FindFirstChildWhichIsA("BasePart", true)) if part then fireRemote("PickUpDecor", part) if waitFor(got, 1.0) then DC.held = newAcc(before) or DC.held DC.picked += 1 return true, "picked " .. label .. " (remote)" end end DC.skip[prompt] = now + 20 return false, label .. ": not confirmed" end
-local function doPlace() local live = Workspace:FindFirstChild("ChristmasTreeLive") local deposit = live and live:FindFirstChild("Deposit") local prompts = {} if deposit then for _, p in ipairs(deposit:GetDescendants()) do if p:IsA("ProximityPrompt") then local a = normName(p.ActionText) if a:find("add", 1, true) or a:find("tree", 1, true) then table.insert(prompts, p) end end end end if #prompts == 0 then return false, "no Add to Tree prompts" end local center, bottom if live and live:IsA("Model") then local ok, cf, size = pcall(function() return live:GetBoundingBox() end) if ok and cf then center = cf.Position bottom = cf.Position - Vector3.new(0, size.Y / 2, 0) end end local enabledN = 0 for _, p in ipairs(prompts) do if p.Enabled then enabledN += 1 end end table.sort(prompts, function(a, b) return a.Enabled and not b.Enabled end) local lastInfo = string.format("no open tree spot (%d prompts, %d enabled)", #prompts, enabledN) for i = 1, math.min(#prompts, 12) do local p = prompts[i] local anchor = promptAnchor(p) or bottom local cf, info = standSpot(anchor, p.MaxActivationDistance, center, nil) if cf then safeTeleport(anchor) if not p.Enabled then waitFor(function() return p.Enabled end, 1.0) end if p.Enabled and holdingDecor() then press(p) if waitFor(function() return not holdingDecor() end, 1.0) then DC.placed += 1 return true, "placed on tree" end fire(p) if waitFor(function() return not holdingDecor() end, 1.0) then DC.placed += 1 return true, "placed on tree (fire)" end end lastInfo = "spot did not accept decor" else lastInfo = tostring(info) end end return false, lastInfo end
+local function snapAcc() 
+    local set = {} 
+    local char = Me.Character 
+    if char then 
+        for _, c in ipairs(char:GetChildren()) do 
+            if c:IsA("Accessory") then set[c] = true end 
+        end 
+    end 
+    return set 
+end
+
+local function newAcc(before) 
+    local char = Me.Character 
+    if not char then return nil end 
+    for _, c in ipairs(char:GetChildren()) do 
+        if c:IsA("Accessory") and not before[c] then return c end 
+    end 
+    return nil 
+end
+
+local function holdingDecor() 
+    local char = Me.Character 
+    if not char then return false end 
+    if DC.held and DC.held.Parent == char then return true end 
+    for _, c in ipairs(char:GetChildren()) do 
+        if c:IsA("Accessory") then 
+            local n = normName(c.Name) 
+            for key in pairs(DC.keys) do 
+                if n:find(key, 1, true) then return true end 
+            end 
+        end 
+    end 
+    return false 
+end
+
+local function doPickup() 
+    local folder = Workspace:FindFirstChild("ChristmasTreePickups") 
+    if not folder then return false, "ChristmasTreePickups missing" end 
+    local now, list, total = os.clock(), {}, 0 
+    for _, p in ipairs(folder:GetDescendants()) do 
+        if p:IsA("ProximityPrompt") and p.Enabled and normName(p.ActionText):find("pick", 1, true) then 
+            total += 1 
+            local o = normName(p.ObjectText) 
+            if #o > 0 then DC.keys[o] = true end 
+            if (DC.skip[p] or 0) < now then table.insert(list, p) end 
+        end 
+    end 
+    DC.left = total 
+    if total == 0 then return false, "no decor left" end 
+    if #list == 0 then return false, "all " .. total .. " pickups cooling down" end 
+    local prompt = nearestOf(list) 
+    local label = (prompt.ObjectText ~= "" and prompt.ObjectText) or "decor" 
+    local before = snapAcc() 
+    local ok, why = goToPrompt(prompt) 
+    if not ok then 
+        DC.skip[prompt] = now + 15 
+        return false, label .. ": " .. tostring(why) 
+    end 
+    local function got() return holdingDecor() or newAcc(before) ~= nil end 
+    for _ = 1, 3 do 
+        if not (prompt.Parent and prompt.Enabled) then break end 
+        press(prompt) 
+        if waitFor(got, 1.0) then 
+            DC.held = newAcc(before) or DC.held 
+            DC.picked += 1 
+            return true, "picked " .. label 
+        end 
+    end 
+    local part = prompt.Parent and (prompt.Parent:IsA("BasePart") and prompt.Parent or prompt.Parent:FindFirstChildWhichIsA("BasePart", true)) 
+    if part then 
+        fireRemote("PickUpDecor", part) 
+        if waitFor(got, 1.0) then 
+            DC.held = newAcc(before) or DC.held 
+            DC.picked += 1 
+            return true, "picked " .. label .. " (remote)" 
+        end 
+    end 
+    DC.skip[prompt] = now + 20 
+    return false, label .. ": not confirmed" 
+end
+
+local function doPlace() 
+    local live = Workspace:FindFirstChild("ChristmasTreeLive") 
+    local deposit = live and live:FindFirstChild("Deposit") 
+    local prompts = {} 
+    if deposit then 
+        for _, p in ipairs(deposit:GetDescendants()) do 
+            if p:IsA("ProximityPrompt") then 
+                local a = normName(p.ActionText) 
+                if a:find("add", 1, true) or a:find("tree", 1, true) then table.insert(prompts, p) end 
+            end 
+        end 
+    end 
+    if #prompts == 0 then return false, "no Add to Tree prompts" end 
+    local center, bottom 
+    if live and live:IsA("Model") then 
+        local ok, cf, size = pcall(function() return live:GetBoundingBox() end) 
+        if ok and cf then 
+            center = cf.Position 
+            bottom = cf.Position - Vector3.new(0, size.Y / 2, 0) 
+        end 
+    end 
+    local enabledN = 0 
+    for _, p in ipairs(prompts) do 
+        if p.Enabled then enabledN += 1 end 
+    end 
+    table.sort(prompts, function(a, b) return a.Enabled and not b.Enabled end) 
+    local lastInfo = string.format("no open tree spot (%d prompts, %d enabled)", #prompts, enabledN) 
+    for i = 1, math.min(#prompts, 12) do 
+        local p = prompts[i] 
+        local anchor = promptAnchor(p) or bottom 
+        local cf, info = standSpot(anchor, p.MaxActivationDistance, center, nil) 
+        if cf then 
+            safeTeleport(anchor) 
+            if not p.Enabled then waitFor(function() return p.Enabled end, 1.0) end 
+            if p.Enabled and holdingDecor() then 
+                press(p) 
+                if waitFor(function() return not holdingDecor() end, 1.0) then 
+                    DC.placed += 1 
+                    return true, "placed on tree" 
+                end 
+                fire(p) 
+                if waitFor(function() return not holdingDecor() end, 1.0) then 
+                    DC.placed += 1 
+                    return true, "placed on tree (fire)" 
+                end 
+            end 
+            lastInfo = "spot did not accept decor" 
+        else 
+            lastInfo = tostring(info) 
+        end 
+    end 
+    return false, lastInfo 
+end
+
 local function decorTick()
-    if not charParts() then M.decor.status = "no character" return 1 end
+    if not charParts() then 
+        M.decor.status = "no character" 
+        return 1 
+    end
     if os.clock() < DC.cooldown then return 0.5 end
-    local ok, placed, msg = withMove("decor", function() if holdingDecor() then return doPlace() end local picked, pmsg = doPickup() if not picked then return false, pmsg end local pl, pm = doPlace() return pl, pmsg .. " | " .. tostring(pm) end)
-    if not ok then M.decor.status = tostring(placed) return 0.6 end
-    M.decor.status = tostring(msg) if placed then log("decor", msg, THEME.green) return 0.2 end
-    DC.cooldown = os.clock() + (holdingDecor() and 3 or 2) return 0.5
+    local ok, placed, msg = withMove("decor", function() 
+        if holdingDecor() then return doPlace() end 
+        local picked, pmsg = doPickup() 
+        if not picked then return false, pmsg end 
+        local pl, pm = doPlace() 
+        return pl, pmsg .. " | " .. tostring(pm) 
+    end)
+    if not ok then 
+        M.decor.status = tostring(placed) 
+        return 0.6 
+    end
+    M.decor.status = tostring(msg) 
+    if placed then 
+        log("decor", msg, THEME.green) 
+        return 0.2 
+    end
+    DC.cooldown = os.clock() + (holdingDecor() and 3 or 2) 
+    return 0.5
 end
 
 --==========================================================================
 -- AUTO HIT RUNAWAY
 --==========================================================================
 local RUNW = { gone = {}, seat = {}, scanAt = -math.huge, flagAt = -math.huge, model = nil }
+
 local function npcIdFrom(...)
     for i = 1, select("#", ...) do
         local v = select(i, ...)
@@ -1632,6 +2266,7 @@ local function npcIdFrom(...)
     end
     return nil
 end
+
 local function posFrom(...)
     local args = table.pack(...)
     for i = 1, args.n do
@@ -1645,37 +2280,51 @@ local function posFrom(...)
     end
     return nil
 end
+
 local function recordNpcPos(...)
     local id = npcIdFrom(...)
     local p = id and posFrom(...)
     if id and p and finite(p) then NPCPOS[id] = { pos = p, t = os.clock() } end
 end
+
 local function queueRunaway(allowFallback, ...)
     local id = npcIdFrom(...)
     if not id and allowFallback then
-        for i = 1, select("#", ...) do local v = select(i, ...) if type(v) == "string" then id = v end end
+        for i = 1, select("#", ...) do 
+            local v = select(i, ...) 
+            if type(v) == "string" then id = v end 
+        end
     end
     if id and not RUN.caught[id] then RUN.queue[id] = os.clock() end
 end
+
 local function nameMatches(obj, id)
     if obj.Name == id then return true end
     if obj:GetAttribute("NpcId") == id then return true end
     local v = obj:FindFirstChild("NpcId")
     return v ~= nil and v:IsA("StringValue") and v.Value == id
 end
+
 local function modelFor(id)
     local held = RUNW.model
     if held and held.Parent and nameMatches(held, id) then return held end
     local cn = Workspace:FindFirstChild("ClientNPCs")
     local m = cn and cn:FindFirstChild(id)
-    if m and m:IsA("Model") then RUNW.model = m return m end
+    if m and m:IsA("Model") then 
+        RUNW.model = m 
+        return m 
+    end
     if os.clock() - RUNW.scanAt < 1 then return nil end
     RUNW.scanAt = os.clock()
     for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model") and nameMatches(obj, id) then RUNW.model = obj return obj end
+        if obj:IsA("Model") and nameMatches(obj, id) then 
+            RUNW.model = obj 
+            return obj 
+        end
     end
     return nil
 end
+
 local function scanRunawayFlags()
     if os.clock() - RUNW.flagAt < 1.5 then return end
     RUNW.flagAt = os.clock()
@@ -1694,6 +2343,7 @@ local function scanRunawayFlags()
         end
     end
 end
+
 local function destinationOf(id)
     local p = NPCPOS[id]
     if p and os.clock() - p.t < 30 then return p.pos end
@@ -1701,6 +2351,7 @@ local function destinationOf(id)
     if tbl and tbl.Parent then return anchorOf(tbl) end
     return nil
 end
+
 local function behindCF(root, hrp, hum)
     local look = root.CFrame.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
@@ -1713,6 +2364,7 @@ local function behindCF(root, hrp, hum)
     if fy and math.abs(fy + rootH - root.Position.Y) <= 6 then y = fy + rootH end
     return CFrame.lookAt(Vector3.new(bx, y, bz), Vector3.new(root.Position.X, y, root.Position.Z))
 end
+
 local function panTool()
     for _, c in ipairs(containers()) do
         for _, t in ipairs(c:GetChildren()) do
@@ -1721,6 +2373,7 @@ local function panTool()
     end
     return nil
 end
+
 local function swingPan(m, id, hum, pan)
     local char = Me.Character
     if pan.Parent ~= char then
@@ -1740,6 +2393,7 @@ local function swingPan(m, id, hum, pan)
     end
     return true
 end
+
 local function chaseRunaway(id)
     local t0, swings, lastWalk = os.clock(), 0, -math.huge
     while running and M.runaway.enabled and os.clock() - t0 < CFG.RUN_MAX do
@@ -1773,15 +2427,26 @@ local function chaseRunaway(id)
     end
     return "stopped (" .. swings .. " swings)"
 end
+
 local function runawayTick()
-    if not M.runaway.enabled then PRIO.runaway = false return 0.5 end
+    if not M.runaway.enabled then 
+        PRIO.runaway = false 
+        return 0.5 
+    end
     scanRunawayFlags()
     local now, pick = os.clock(), nil
     for id, t in pairs(RUN.queue) do
-        if RUN.caught[id] or now - t > 40 then RUN.queue[id] = nil
-        elseif not pick then pick = id end
+        if RUN.caught[id] or now - t > 40 then 
+            RUN.queue[id] = nil
+        elseif not pick then 
+            pick = id 
+        end
     end
-    if not pick then PRIO.runaway = false M.runaway.status = "watching the whole map" return 0.4 end
+    if not pick then 
+        PRIO.runaway = false 
+        M.runaway.status = "watching the whole map" 
+        return 0.4 
+    end
     PRIO.runaway = true
     local okc, ok, res = pcall(withMove, "runaway", function() return chaseRunaway(pick) end)
     if not okc then
@@ -1789,7 +2454,10 @@ local function runawayTick()
         M.runaway.status = "error: " .. tostring(ok)
         return 0.5
     end
-    if not ok then M.runaway.status = "waiting for the bot to be free" return 0.15 end
+    if not ok then 
+        M.runaway.status = "waiting for the bot to be free" 
+        return 0.15 
+    end
     PRIO.runaway = false
     RUN.queue[pick] = nil
     if RUN.caught[pick] then RUN.done += 1 end
@@ -1799,7 +2467,7 @@ local function runawayTick()
 end
 
 --==========================================================================
--- NEW: AUTO HIT SLEEPING
+-- AUTO HIT SLEEPING (NEW)
 --==========================================================================
 local function isSleeping(obj)
     if not obj or not obj:IsA("Model") then return false end
@@ -1918,7 +2586,7 @@ local function sleepingTick()
         return 1
     end
 
-    local ok, res = withMove("sleeping", function() return hitSleeping(best) end)
+    local ok, res, why = withMove("sleeping", function() return hitSleeping(best) end)
     if not ok then
         M.sleeping.status = "waiting: " .. tostring(res)
         return 0.4
@@ -1930,7 +2598,7 @@ local function sleepingTick()
         return 0.6
     end
 
-    M.sleeping.status = "failed: " .. tostring(res)
+    M.sleeping.status = "failed: " .. tostring(why)
     return 0.6
 end
 
@@ -1945,12 +2613,14 @@ onEvent("NPCSeated", function(npcId, _chair, tbl, seat)
     C.seatOf[npcId] = key
     if typeof(tbl) == "Instance" then SEATTBL[npcId] = tbl RUNW.seat[npcId] = tbl end
 end)
+
 onEvent("NPCDespawned", function(npcId)
     if type(npcId) ~= "string" then return end
     local key = C.seatOf[npcId]
     if key then C.occ[key] = nil C.seatOf[npcId] = nil end
     SEATTBL[npcId] = nil S.pendingDrinks[npcId] = nil RUN.queue[npcId] = nil RUNW.gone[npcId] = os.clock() NPCPOS[npcId] = nil
 end)
+
 onEvent("NPCSpawned", function(info)
     if type(info) ~= "table" or type(info.PlotName) ~= "string" then return end
     if tostring(info.PlotOwnerId) == tostring(Me.UserId) then
@@ -1958,11 +2628,13 @@ onEvent("NPCSpawned", function(info)
         if m then PLOT.locked = m end
     end
 end)
+
 onEvent("CounterActionResult", function(data)
     if type(data) ~= "table" then return end
     local rid = data.RequestId
     if rid ~= nil and C.pending[rid] == false then C.pending[rid] = data end
 end)
+
 onEvent("SoftdrinkOrdersUpdated", function(dict)
     if type(dict) ~= "table" then return end
     if not S.dumpedOrders then
@@ -1975,12 +2647,26 @@ onEvent("SoftdrinkOrdersUpdated", function(dict)
     end
     S.pendingDrinks = fresh
 end)
+
 onEvent("AdditionalOrder", function(npcId, drink)
     if type(npcId) ~= "string" then return end
     S.pendingDrinks[npcId] = drink or true
 end)
-onEvent("AngpaoSpawned", function(...) local args = table.pack(...) for i = 1, args.n do for _, f in ipairs(parseReply(args[i])) do addAP(f.pos, f.inst, "event") end end end)
-onEvent("AngpaoRemoved", function(...) local args = table.pack(...) for i = 1, args.n do for _, f in ipairs(parseReply(args[i])) do removeAP(f.pos, f.inst) end end end)
+
+onEvent("AngpaoSpawned", function(...) 
+    local args = table.pack(...) 
+    for i = 1, args.n do 
+        for _, f in ipairs(parseReply(args[i])) do addAP(f.pos, f.inst, "event") end 
+    end 
+end)
+
+onEvent("AngpaoRemoved", function(...) 
+    local args = table.pack(...) 
+    for i = 1, args.n do 
+        for _, f in ipairs(parseReply(args[i])) do removeAP(f.pos, f.inst) end 
+    end 
+end)
+
 onEvent("CustomerRanAwayEvent", function(...) queueRunaway(true, ...) end)
 onEvent("HitRunawayEvent", function(...) queueRunaway(false, ...) end)
 onEvent("RunawaySwing", function(...) queueRunaway(false, ...) end)
@@ -1990,10 +2676,14 @@ onEvent("NPCRagdolled", function(...)
     local id = npcIdFrom(...)
     if id then RUN.caught[id] = true RUN.queue[id] = nil end
 end)
-onEvent("WorkerDisappeared", function(who) local name = typeof(who) == "Instance" and who.Name or (type(who) == "string" and who) or nil if name then H.gone[name] = os.clock() end end)
+
+onEvent("WorkerDisappeared", function(who) 
+    local name = typeof(who) == "Instance" and who.Name or (type(who) == "string" and who) or nil 
+    if name then H.gone[name] = os.clock() end 
+end)
+
 onEvent("StaffChanged", function() H.lastStaff = -math.huge end)
 
--- FOOD EVENT HOOKS
 onEvent("FoodPlacedOnServe", function(...)
     local model, tbl, npc, dish = parseFoodEvent(...)
     FOOD_EVENTS.recentPlaced = os.clock()
@@ -2021,7 +2711,13 @@ end)
 --==========================================================================
 -- MODULES
 --==========================================================================
-local function newModule(key, label, tick, idle) local m = { key = key, label = label, tick = tick, idle = idle or 0.5, enabled = false, status = "idle", errors = 0, lastErr = nil, runs = 0 } M[key] = m table.insert(ORDER, m) return m end
+local function newModule(key, label, tick, idle) 
+    local m = { key = key, label = label, tick = tick, idle = idle or 0.5, enabled = false, status = "idle", errors = 0, lastErr = nil, runs = 0 } 
+    M[key] = m 
+    table.insert(ORDER, m) 
+    return m 
+end
+
 newModule("counter", "Auto Counter", counterTick, 0.5)
 newModule("hire", "Auto Hire", hireTick, 0.2)
 newModule("trash", "Auto Clean", trashTick, 0.5)
@@ -2033,17 +2729,74 @@ newModule("decor", "Auto Decor", decorTick, 0.5)
 newModule("runaway", "Auto Runaway", runawayTick, 0.5)
 newModule("sleeping", "Auto Hit Sleeping", sleepingTick, 0.5)
 
-local function startModule(m) task.spawn(function() while running do if m.enabled then local ok, res = pcall(m.tick) m.runs += 1 if ok then m.errors = 0 task.wait(type(res) == "number" and res or m.idle) else m.errors += 1 m.lastErr = tostring(res) m.status = "error" log(m.key, "error: " .. m.lastErr, THEME.red) if m.errors >= 6 then m.enabled = false m.status = "stopped after errors" log(m.key, "auto-stopped after 6 errors", THEME.red) uiRefresh() end task.wait(math.min(1 + m.errors, 8)) end else task.wait(0.4) end end end) end
+local function startModule(m) 
+    task.spawn(function() 
+        while running do 
+            if m.enabled then 
+                local ok, res = pcall(m.tick) 
+                m.runs += 1 
+                if ok then 
+                    m.errors = 0 
+                    task.wait(type(res) == "number" and res or m.idle) 
+                else 
+                    m.errors += 1 
+                    m.lastErr = tostring(res) 
+                    m.status = "error" 
+                    log(m.key, "error: " .. m.lastErr, THEME.red) 
+                    if m.errors >= 6 then 
+                        m.enabled = false 
+                        m.status = "stopped after errors" 
+                        log(m.key, "auto-stopped after 6 errors", THEME.red) 
+                        uiRefresh() 
+                    end 
+                    task.wait(math.min(1 + m.errors, 8)) 
+                end 
+            else 
+                task.wait(0.4) 
+            end 
+        end 
+    end) 
+end
 
 --==========================================================================
 -- UI
 --==========================================================================
 local function buildUI()
-    local function mk(class, props, parent) local o = Instance.new(class) for k, v in pairs(props or {}) do o[k] = v end if parent then o.Parent = parent end return o end
-    local function rounded(o, r) mk("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o) return o end
-    local function draggable(target, handle) local dragging, dragStart, startPos = false, nil, nil table.insert(HOOKS, handle.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging, dragStart, startPos = true, input.Position, target.Position end end)) table.insert(HOOKS, UIS.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end end)) table.insert(HOOKS, UIS.InputChanged:Connect(function(input) if not running or not dragging then return end if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then local d = input.Position - dragStart target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y) end end)) end
+    local function mk(class, props, parent) 
+        local o = Instance.new(class) 
+        for k, v in pairs(props or {}) do o[k] = v end 
+        if parent then o.Parent = parent end 
+        return o 
+    end
+    
+    local function rounded(o, r) 
+        mk("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o) 
+        return o 
+    end
+    
+    local function draggable(target, handle) 
+        local dragging, dragStart, startPos = false, nil, nil 
+        table.insert(HOOKS, handle.InputBegan:Connect(function(input) 
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
+                dragging, dragStart, startPos = true, input.Position, target.Position 
+            end 
+        end)) 
+        table.insert(HOOKS, UIS.InputEnded:Connect(function(input) 
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
+                dragging = false 
+            end 
+        end)) 
+        table.insert(HOOKS, UIS.InputChanged:Connect(function(input) 
+            if not running or not dragging then return end 
+            if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then 
+                local d = input.Position - dragStart 
+                target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y) 
+            end 
+        end)) 
+    end
 
-    local old = PlayerGui:FindFirstChild("KarinderyaMaster") if old then old:Destroy() end
+    local old = PlayerGui:FindFirstChild("KarinderyaMaster") 
+    if old then old:Destroy() end
     local gui = mk("ScreenGui", { Name = "KarinderyaMaster", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 900 }, PlayerGui)
 
     local cam = Workspace.CurrentCamera
@@ -2061,7 +2814,12 @@ local function buildUI()
     mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 6), Size = UDim2.new(1, -100, 0, 20), Font = Enum.Font.GothamBlack, TextSize = 14, TextColor3 = THEME.gold, TextXAlignment = Enum.TextXAlignment.Left, Text = "KARINDERYA MASTER" }, head)
     mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 26), Size = UDim2.new(1, -100, 0, 14), Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left, Text = VERSION .. "  ·  Ultimate Integration" }, head)
 
-    local function headBtn(x, text, color) local b = mk("TextButton", { Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, x, 0.5, -12), BackgroundColor3 = color, BorderSizePixel = 0, Text = text, Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = Color3.new(1, 1, 1) }, head) rounded(b, 6) return b end
+    local function headBtn(x, text, color) 
+        local b = mk("TextButton", { Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, x, 0.5, -12), BackgroundColor3 = color, BorderSizePixel = 0, Text = text, Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = Color3.new(1, 1, 1) }, head) 
+        rounded(b, 6) 
+        return b 
+    end
+    
     local minBtn = headBtn(-60, "–", Color3.fromRGB(70, 75, 95))
     local closeBtn = headBtn(-30, "×", THEME.red)
 
@@ -2091,7 +2849,8 @@ local function buildUI()
     local targetOpts = {}
     for i, r in ipairs(RARITY_ORDER) do
         local btn = mk("TextButton", { Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = (H.targetRarity == r) and THEME.head1 or THEME.panel, BorderSizePixel = 0, Text = r, Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = THEME.text, LayoutOrder = i, ZIndex = 11 }, targetDrop)
-        rounded(btn, 4) targetOpts[r] = btn
+        rounded(btn, 4) 
+        targetOpts[r] = btn
         btn.MouseButton1Click:Connect(function()
             H.targetRarity = r
             for opt, b in pairs(targetOpts) do b.BackgroundColor3 = (opt == r) and THEME.head1 or THEME.panel end
@@ -2100,11 +2859,16 @@ local function buildUI()
             log("hire", "target rarity -> " .. r, THEME.gold)
         end)
     end
+    
     for i, r in ipairs(RARITY_ORDER) do
         local btn = mk("TextButton", { Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = REJECT_LIST[r] and THEME.red or THEME.panel, BorderSizePixel = 0, Text = r, Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = THEME.text, LayoutOrder = i, ZIndex = 11 }, rejectDrop)
         rounded(btn, 4)
-        btn.MouseButton1Click:Connect(function() REJECT_LIST[r] = not REJECT_LIST[r] btn.BackgroundColor3 = REJECT_LIST[r] and THEME.red or THEME.panel end)
+        btn.MouseButton1Click:Connect(function() 
+            REJECT_LIST[r] = not REJECT_LIST[r] 
+            btn.BackgroundColor3 = REJECT_LIST[r] and THEME.red or THEME.panel 
+        end)
     end
+    
     hireRarityBtn.MouseButton1Click:Connect(function() targetDrop.Visible = not targetDrop.Visible rejectDrop.Visible = false end)
     rejectRarityBtn.MouseButton1Click:Connect(function() rejectDrop.Visible = not rejectDrop.Visible targetDrop.Visible = false end)
     panicBtn.MouseButton1Click:Connect(function() for _, m in ipairs(ORDER) do m.enabled = false end log("panic", "all modules stopped", THEME.red) end)
@@ -2123,26 +2887,50 @@ local function buildUI()
         rounded(knob, 8)
         local hit = mk("TextButton", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "" }, track)
         ROWS[m.key] = { dot = dot, status = st, track = track, knob = knob }
-        hit.MouseButton1Click:Connect(function() m.enabled = not m.enabled m.errors = 0 log(m.key, m.enabled and "started" or "stopped", m.enabled and THEME.green or THEME.orange) end)
+        hit.MouseButton1Click:Connect(function() 
+            m.enabled = not m.enabled 
+            m.errors = 0 
+            log(m.key, m.enabled and "started" or "stopped", m.enabled and THEME.green or THEME.orange) 
+        end)
     end
+    
     for i, m in ipairs(ORDER) do buildRow(m, i) end
 
     local function paintRow(m)
-        local r = ROWS[m.key] if not r then return end
+        local r = ROWS[m.key] 
+        if not r then return end
         r.track.BackgroundColor3 = m.enabled and THEME.green or THEME.gray
         r.knob.Position = m.enabled and UDim2.fromOffset(22, 2) or UDim2.fromOffset(2, 2)
-        local s = m.status or "" local col = THEME.gray
-        if m.errors > 0 then col = THEME.red elseif m.enabled and (s:find("wait", 1, true) or s:find("busy", 1, true) or s:find("no ", 1, true)) then col = THEME.orange elseif m.enabled then col = THEME.green end
-        r.dot.BackgroundColor3 = col r.status.Text = s
+        local s = m.status or "" 
+        local col = THEME.gray
+        if m.errors > 0 then 
+            col = THEME.red 
+        elseif m.enabled and (s:find("wait", 1, true) or s:find("busy", 1, true) or s:find("no ", 1, true)) then 
+            col = THEME.orange 
+        elseif m.enabled then 
+            col = THEME.green 
+        end
+        r.dot.BackgroundColor3 = col 
+        r.status.Text = s
     end
-    uiRefresh = function() for _, m in ipairs(ORDER) do paintRow(m) end end
+    
+    uiRefresh = function() 
+        for _, m in ipairs(ORDER) do paintRow(m) end 
+    end
 
     local pill = mk("TextButton", { Size = UDim2.fromOffset(160, 28), Position = win.Position, BackgroundColor3 = THEME.head1, BorderSizePixel = 0, Visible = false, Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = THEME.text, Text = "▲ KARINDERYA MASTER", Active = true }, gui)
     rounded(pill, 14)
     minBtn.MouseButton1Click:Connect(function() pill.Position = win.Position win.Visible = false pill.Visible = true end)
     pill.MouseButton1Click:Connect(function() win.Position = pill.Position pill.Visible = false win.Visible = true end)
     draggable(win, head) draggable(pill, pill)
-    closeBtn.MouseButton1Click:Connect(function() running = false for _, m in ipairs(ORDER) do m.enabled = false end for _, c in ipairs(HOOKS) do pcall(function() c:Disconnect() end) end table.clear(HOOKS) gui:Destroy() end)
+    
+    closeBtn.MouseButton1Click:Connect(function() 
+        running = false 
+        for _, m in ipairs(ORDER) do m.enabled = false end 
+        for _, c in ipairs(HOOKS) do pcall(function() c:Disconnect() end) end 
+        table.clear(HOOKS) 
+        gui:Destroy() 
+    end)
 
     task.spawn(function()
         while running do
